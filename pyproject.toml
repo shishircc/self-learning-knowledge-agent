@@ -3,6 +3,9 @@ name = "coco"
 version = "0.1.0"
 description = "A self-learning conversational agent"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Shishir Choudhary"}]
 dependencies = [
     "anthropic>=0.40.0",
     "sentence-transformers>=2.7.0",

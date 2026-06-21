@@ -156,4 +156,4 @@ Issues, ideas, and prompt/threshold experiments are all welcome.
 
 ## License
 
-TBD — open an issue if you'd like to use Coco in your own work and we'll sort licensing.
+MIT — see [`LICENSE`](./LICENSE) for the full text. In short: use it freely in personal or commercial projects, keep the copyright notice, no warranty.
