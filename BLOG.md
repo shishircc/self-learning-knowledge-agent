@@ -1,4 +1,4 @@
-# When Vibe Coding Hits a Wall: The AI Engineering Workflow Behind Coco, a Real-Time Self-Learning Knowledge Agent
+# When Vibe Coding Hits a Wall: The AI Engineering Workflow Behind Coco, a Self-Learning Knowledge Agent
 
 *A walk-through of Coco: a conversational agent that builds long-term memory while you type, organizes it as multi-link knowledge packets, and retrieves it under 100ms — plus the engineering workflow that made building it actually possible.*
 
@@ -149,30 +149,13 @@ python -m coco
 
 That gives you a colored prompt, a streaming reply, and brief `recalling:` / `remembered:` hints as the memory layer moves. Flip `debug_print_streaming: true` in `config.json` if you want to watch the per-channel RRF breakdown live while you type — that's the developer-mode view I used to catch the scoring issue you'll read about later.
 
-## A map of the rest
-
-The remainder of this post does two things: walks through Coco's architecture in enough depth that you could build something similar, and shows the iterations that produced it.
-
-1. **Architecture** — the meat of the post. Five components, then the iterations that shaped them:
-   - **The packet** — topic-scoped knowledge with multi-facet retrieval handles and an entity list.
-   - **Retrieval** — three-channel hybrid (BM25 on topics, max-cosine on topic vectors, BM25 on the entity bag), fused by Reciprocal Rank Fusion with zero-score filtering.
-   - **Real-time** — streaming triggers that retrieve *while you type*, with novelty gates and a small fast LM.
-   - **The write path** — how new knowledge gets stored, via a scratchpad consolidation layer.
-   - **Strength** — decaying weighted activity that makes the system feel alive (and gates multi-fidelity content).
-   - **How the architecture actually emerged** — three iterations against a running system that produced the shape above.
-2. **Lessons** — observability as the load-bearing partner to specs; where AI gets it wrong; when vibe coding is still the right call; two takeaways.
-
-If you only want the architecture, the next section is where it starts. If you only want the workflow, jump to "How the architecture actually emerged" and then the lessons.
-
 ## Architecture
 
-Six pieces, in the order that makes them easiest to understand. Packets first (the data structure that everything else operates on), then how retrieval works against them, then how retrieval gets triggered in real time, then how new knowledge gets written back, then how strength makes the whole thing dynamic — and finally a walk through the three iterations that shaped this design.
+Six pieces, in the order they make most sense: the packet (the data shape everything operates on), retrieval against it, how retrieval gets triggered in real time, the write path, the strength dynamics that make the whole thing alive, and the three iterations that produced this design.
 
 ### The packet
 
-The atomic unit of long-term memory in Coco is a **packet**. It's not a document chunk. It's a unit of related knowledge — typically a person, a project, a procedure, or a topic. Think of it as a node in a personal wiki, but smaller and more dynamic.
-
-Each packet carries five things:
+The atomic unit of long-term memory is a **packet** — a topic-scoped unit (a project, a person, a procedure), not a document chunk. Each carries five things:
 
 ```
 Packet
@@ -183,65 +166,40 @@ Packet
     summary  one paragraph
     full     markdown, the complete content
   strength_events: append-only log of retrieval / use / write events
-  ...metadata (id, timestamps, source sessions)
 ```
 
-Each field exists for a specific reason.
+Each field earns its place:
 
-**Multiple topic phrases, not one.** This is the multi-entry-point requirement, made concrete. The same memory needs to be reachable from many conversational angles. A packet about a project at work might have facets like `["Apollo — vLLM inference platform migration", "Apollo's rollout timeline and milestones", "Apollo's GPU allocation and cost trade-offs"]`. Mentioning "the migration deadline" matches the second facet via semantic similarity; mentioning "H100 spot pricing" matches the third. **One memory, many doors.** A single topic field would force me to pick one — and any conversation that came in through a different angle would miss.
-
-**Entity list, separate from topic phrases.** Some things are reachable by *name*, not topic. If you mention "Apollo" or "vLLM" anywhere in your message, any packet whose entity bag contains those tokens becomes a candidate — no semantic embedding needed. This is the closest thing to a "direct" lookup channel and it's much cheaper than vector search.
-
-**Multi-fidelity content (gist / summary / full).** A brand new packet has only a gist. As it gets used more, it earns the right to surface more detail — a paragraph summary first, then the full content. This solves the prompt-size problem: ten packets at gist-level cost almost nothing to inject; one well-used packet at full-fidelity costs more but is genuinely worth the tokens. The fidelity-vs-strength gate is what makes the memory layer scale gracefully.
-
-**Strength events as an append-only log.** Every retrieval, every "use" (the reply LLM actually drew on the packet), every write event gets logged with a timestamp. Strength is computed lazily from the log with exponential decay. The math is simple — `Σ event_weight · 0.5^((now − ts) / half_life)` — but the effect is profound: the system feels *alive*. Packets you've been using stay strong; packets you've ignored gracefully demote.
-
-This shape is what "multi-link, real-time knowledge memory" actually looks like at a data level. Now: how do you retrieve it?
+- **Multiple topic phrases** make the same memory reachable from many angles. A packet about a work project might carry facets like `["Apollo — vLLM inference platform migration", "Apollo's rollout timeline", "Apollo's GPU cost trade-offs"]`. "The migration deadline" matches the second; "H100 spot pricing" matches the third. One memory, many doors.
+- **The entity list** is the named-lookup channel — cheap, direct. Mentioning "Apollo" or "vLLM" anywhere reaches matching packets without any embedding.
+- **Multi-fidelity content** lets weak packets surface as a one-line gist and well-used packets unfold to full content — that's how the prompt budget gets allocated across many candidates.
+- **Strength events** are an append-only log decayed by time. Stuff you use stays sharp; stuff you don't fades. The system feels *alive*, not static.
 
 ### Retrieval: three channels, fused by rank
 
-Given a conversational moment — say, you've just typed "I need to check on the Apollo rollout" — how does the system find the right packet?
+Given a moment in conversation — say you've just typed "I need to check on the Apollo rollout" — three independent signals score every candidate packet:
 
-Three independent signals.
+- **Channel A (topic BM25):** lexical overlap with the packet's combined topic phrases. Fast, no embedding.
+- **Channel B (max cosine across topic vectors):** semantic match; the *best matching facet* wins. Catches paraphrases ("model serving costs" → "GPU cost trade-offs").
+- **Channel C (entity bag BM25):** direct name lookup. Mentioning "Apollo" reaches Apollo-packets even with no semantic signal.
 
-**Channel A: BM25 over topic text.** Treat each packet's combined topic phrases as a tiny "document." Lexical match scores it. If you mention "Apollo rollout" and a packet's facet is "Apollo — vLLM inference platform migration," BM25 picks it up. This is pure word-overlap matching — fast, no embedding required, handles named entities and rare terms well.
-
-**Channel B: max cosine across topic vectors.** Embed your current topic phrase (we'll see where that comes from in a moment), then take the maximum cosine similarity against any of the packet's topic facet vectors. Multi-facet packets shine here — the *best matching facet* wins, not the average. Semantic match, not lexical: "model serving costs" matches a "GPU allocation and cost trade-offs" facet even though no words overlap.
-
-**Channel C: BM25 over the entity bag.** Same as Channel A, but the "document" is the packet's entity list. This is the named-lookup channel. Mentioning "Apollo" anywhere in your message reaches Apollo-packets directly, no semantic similarity needed.
-
-These three channels are combined by **Reciprocal Rank Fusion (RRF)**:
+These get combined by **Reciprocal Rank Fusion**:
 
 ```
 RRF(packet) = Σ_channel  1 / (k + rank_in_channel + 1)
 ```
 
-Each channel ranks all candidate packets independently. RRF sums the *ranks*, not the scores. This is important: BM25 scores are unbounded; cosine similarities live in [0, 1]. Combining raw scores would let whichever channel happens to have larger magnitudes dominate. Combining ranks normalizes them — both channels get equal voice.
+RRF sums *ranks*, not scores — which normalizes wildly different scoring scales (BM25 is unbounded; cosine is 0–1). The default `k = 60` is tuned for million-document IR corpora; at personal scale it over-compresses, so Coco uses **`k = 2`**. Combined with **zero-score filtering** (a packet only gets a rank in a channel if its raw score is meaningfully above zero), irrelevant packets land at exactly `0.0` instead of inheriting "lowest in queue" noise.
 
-There are two important modifications I had to make.
-
-**First: zero-score filtering.** A packet gets a rank in a channel only if its raw score is above a per-channel floor (zero for BM25, a small positive for cosine). Below the floor, the packet contributes nothing from that channel. Without this, every packet — even an obviously irrelevant one — gets *some* RRF contribution just for being in the candidate set, because it's still last in the rank queue.
-
-**Second: `k = 2`, not 60.** RRF's default `k = 60` is tuned for IR corpora of millions of documents, where rank-1 vs rank-10 contributions are still meaningfully different. At my personal scale (tens of packets), `k = 60` over-compresses. With `k = 2`:
-
-```
-rank-1 contribution = 1 / (2 + 1)   = 0.333
-rank-4 contribution = 1 / (2 + 4)   = 0.167
-```
-
-Sharp separation. Combined with zero-score filtering, an irrelevant packet lands at exactly `0.0` instead of inheriting `0.04`-ish noise from being last in the queue.
-
-A small per-packet strength bias gets added on top — packets you've used a lot recently bias slightly higher, but a sharp semantic match can still surface a packet you haven't touched in months. This keeps retrieval responsive without becoming a popularity contest.
+A small per-packet **strength bias** rides on top — packets you've used recently nudge ahead in close races, but a sharp semantic match can still surface a packet you haven't touched in months.
 
 ### Real-time: retrieving while you type
 
-Here's where it stops feeling like a chatbot and starts feeling like an agent.
+The naive way to do retrieval is to wait for Enter, search memory, then call the LLM. Two-second pause. The agent feels slow.
 
-The naive way to do retrieval is: wait for the user to press Enter, then search memory, then call the LLM. Two-second pause. The agent feels slow.
+The model that works is *predict and prefetch*: retrieve while the user is still typing.
 
-The model that actually works is *predict and prefetch*: retrieve while the user is still typing.
-
-Implementation: there's a streaming console layer that fires `partial(text)` events as you type — debounced (350ms quiet), with a word-count override (every 5 new words so long monologues don't stall). For each partial, a small fast LM (Claude Haiku) is called with the partial text and the current session state:
+As you type, a streaming layer fires `partial(text)` events — debounced (350ms quiet), with a word-count override (every 5 new words). For each partial, a small fast LM (Claude Haiku) extracts:
 
 ```json
 {
@@ -254,14 +212,7 @@ Implementation: there's a streaming console layer that fires `partial(text)` eve
 }
 ```
 
-Two gates before the agent does anything:
-
-1. **Substantive?** Niceties like "hi" or "thanks" get `is_meaningful: false`. Skip.
-2. **Novel?** If the topic summary is already in the session's topic list and the entities are all already in loaded packets' entity bags, nothing new is happening. Skip.
-
-Only if you pass both gates does the agent run RRF retrieval. By the time you press Enter, the relevant packets are already loaded into context. The main reply LLM (Claude Sonnet) is then *purely conversational* — it doesn't classify topics or trigger retrieval; it just talks, using the loaded packets as its knowledge.
-
-Here's the full flow:
+Two gates: is it substantive (not niceties)? Is it novel (not already in the session)? Both pass → 3-channel RRF runs and packets load. By the time you press Enter, the right memories are already there. The main reply LLM is then *purely conversational* — it doesn't classify topics or trigger retrieval; it just talks.
 
 ```mermaid
 sequenceDiagram
@@ -295,53 +246,33 @@ sequenceDiagram
     ST->>CT: chat_turn with packets already loaded
 ```
 
-Two design notes about this flow.
+The small LM owns novelty (no cosine double-check) and the reply LLM no longer classifies topics — moving that to streaming resolved a chicken-and-egg where retrieval needed the topic but the topic came from the same LLM call that needed retrieval.
 
-**The small LM is authoritative for novelty.** It already knows what's in the session (passed in as context). The agent doesn't double-check via cosine. Cheaper, simpler, faster — and the small LM is genuinely good at this bounded task.
+The effect: tokens of the reply arrive in under a second with the right memory loaded. It feels like talking to something that knows you.
 
-**The main reply LLM no longer emits a topic_facet.** That was the v1 design — and it created a chicken-and-egg problem: retrieval needed the topic, but the topic came from the same LLM call that needed retrieval to have already happened. Moving topic classification to the streaming small LM resolved it cleanly.
+### The write path: how knowledge gets stored
 
-The conversational effect is striking. You type a question; tokens of the reply start arriving in under a second; the right memories are already there. It doesn't feel like a chatbot with a memory hack. It feels like talking to something that knows you.
-
-### The write path: how knowledge actually gets stored
-
-Every turn potentially produces new knowledge. The agent has to decide where it goes.
-
-The reply LLM's structured output declares zero or more new-knowledge items:
+Every turn potentially produces new knowledge. The reply LLM declares it as structured output:
 
 ```json
 {
-  "reply": "Got it — Apollo's deadline slipped to Q4 because of the H100 procurement delays. I'll keep that context for future roadmap conversations.",
-  "packets_used": ["pkt_abc12"],
   "new_knowledge": [
-    {
-      "content": "Apollo's Q3 deadline moved to Q4 due to H100 procurement delays.",
-      "conflicts_with": null
-    }
+    {"content": "Apollo's Q3 deadline moved to Q4 due to H100 procurement delays.", "conflicts_with": null}
   ]
 }
 ```
 
-For each new-knowledge item, a three-way decision:
+For each item, a three-way decision:
 
-1. **Match an existing loaded packet?** If the current conversation topic has a strong facet match (cosine ≥ 0.6) to a packet's topic vectors, *integrate* the new content into that packet. An integrate-on-write LLM call merges the new content into the existing markdown, updates the topic facets and entity list, and flags contradictions. If a contradiction is detected, the agent pauses and asks the user before applying it.
-2. **Match a recent scratchpad entry?** If two near-duplicate topic phrases land in scratchpad across sessions, promote them to a fresh packet. This is the "spaced repetition" route: things you mention once get a placeholder; things you mention twice earn permanence.
-3. **Neither?** Insert as a fresh scratchpad entry. It'll wait for another mention.
+1. **Strong facet match to a loaded packet** (cosine ≥ 0.6)? *Integrate-on-write* — an LLM call merges the new content in, updates topic facets and entities, and flags contradictions. Conflicts pause to ask you.
+2. **Match a recent scratchpad entry?** Promote both to a fresh packet — "spaced repetition" consolidation.
+3. **Neither?** Insert into scratchpad. It'll wait for another mention.
 
-The **scratchpad** is the consolidation layer. Stuff that's mentioned once but isn't yet meaningful enough for a packet lives there. Entries that don't recur within ~10 sessions get pruned. Everything else either consolidates into a packet or fades.
-
-The economic reason this matters: not every passing mention deserves long-term memory. Without the scratchpad layer, the agent would either accumulate noise (every utterance becomes a packet) or miss things (a meaningful detail mentioned briefly never gets captured). The scratchpad is the buffer that gives the system *judgment* about what to keep.
+The **scratchpad** is the buffer that gives the system judgment. Without it, every passing mention either becomes a packet (noise) or vanishes (missed). With it, only things you reinforce earn permanence; entries unused for ~10 sessions get pruned.
 
 ### Strength: the system feels alive
 
-Strength is what makes the difference between a static knowledge base and a dynamic memory.
-
-A packet's strength governs two things:
-
-1. **Which content slice loads.** A weak packet surfaces only its gist (one line). A medium-strength packet loads the paragraph summary. A strong, frequently-used packet loads the full content. This is how the prompt budget gets allocated — ten weakly-relevant packets at gist-level cost what one strongly-used packet at full fidelity costs.
-2. **Retrieval ranking bias.** A stronger packet gets a small additive boost on its final RRF score — so when two packets are semantically similar, the one you've been using lately surfaces first.
-
-Computation:
+Strength gates two things: which content slice loads (weak packet → gist; strong → full) and a small additive bias on retrieval ranking. The computation:
 
 ```
 strength(packet, now) = Σ over events of:
@@ -351,25 +282,19 @@ weights:   retrieval = 1, use = 3, write = 5
 half_life: 30 days
 ```
 
-Three event types: every retrieval adds 1 (you considered the packet), every "use" adds 3 (the reply LLM actually drew on it), every write adds 5 (new content was integrated). All decay exponentially with a 30-day half-life.
+Every retrieval adds 1, every "use" adds 3 (the reply LLM actually drew on the packet), every write adds 5. All decay exponentially at a 30-day half-life.
 
-The math is trivially cheap. The behavior is that the system *feels alive*: packets you stop using gracefully demote out of the strong tier without disappearing, and the moment you start using them again they ramp back up. There's no global garbage collection, no manual archival — just a single weighted log per packet.
+Trivially cheap math; the behavior is that the system *feels alive*. Packets you stop using gracefully demote. The moment you start using them again, they ramp back up. No garbage collection, no archival — just a weighted log per packet.
 
 ### How the architecture actually emerged
 
-The architecture above didn't come from one design session. It emerged through three iterations against a running system, using the workflow described earlier — `DESIGN.md` → `TDS.md` with sequence diagrams → AI implements → run + observe → update TDS → AI updates code. Each iteration had the same shape: I observed a problem, went back to the TDS, the code change followed.
+The shape above came from three iterations against a running system. Each followed the same pattern: observe a problem, update TDS, code change follows.
 
-**Iteration 1: single-topic → multi-facet packets.** The first build had packets with one topic and one vector each. I ran a few conversations. I noticed that mentioning the codename "Apollo" pulled its packet, but mentioning "the inference platform we're standing up" didn't — the single topic phrase ("Apollo migration project") wasn't semantically close enough to a paraphrase that didn't include the codename. A single vector couldn't span both angles.
+**Iteration 1 — single-topic → multi-facet packets.** The first build had one topic and one vector per packet. Conversations revealed the gap: mentioning the codename "Apollo" pulled its packet, but "the inference platform we're standing up" didn't. A single vector couldn't span both angles. The fix was structural — a list of topic facets, each with its own vector. TDS first, four files updated, ~15 minutes total.
 
-Going back to the design, the move was clear: each packet needed a *list* of topic facets, each with its own vector. I updated `TDS.md` first — the packet schema, the retrieval algorithm, the write-path facet-match logic. Then asked the AI to align the code. The change touched four files and converged in about fifteen minutes.
+**Iteration 2 — Enter-only → streaming retrieval.** The agent worked but felt slow. The fix wasn't faster code; it was *earlier* code. This needed a real architectural shift — streaming console, small-LM extractor on partials, novelty gates, the reply LLM moving out of the retrieval business. I drew the new flow as the Mermaid sequence diagram above *before* writing any code. Once the diagram captured intent, the code cascaded.
 
-**Iteration 2: Enter-only → streaming retrieval.** The agent worked, but it felt slow. The retrieval pass and the LLM call only started after I pressed Enter. I'd type a question, wait a couple of seconds, get a reply.
-
-The fix wasn't faster code — it was *earlier* code. Retrieval should fire while I was typing. This required a real architectural shift: a streaming console layer (prompt_toolkit with debounce + word-count triggers), a small-LM extractor running on debounced partials, novelty gates, and a single handler that ran for both partials and submit events. The main reply LLM moved out of the retrieval business entirely — it just received already-loaded packets and talked.
-
-I drew the new flow as a Mermaid sequence diagram in `TDS.md` *before* writing a line of new code. That's the diagram you saw earlier. Once the diagram captured the design, the code edits cascaded — every module change had a section in the TDS that said exactly what needed to happen.
-
-**Iteration 3: RRF over-compression.** Everything was running. But retrieval still occasionally felt off — Coco would surface an irrelevant packet alongside the right one. I turned on a developer-mode debug toggle and watched a real retrieval log:
+**Iteration 3 — RRF over-compression.** Coco was running but retrieval still occasionally surfaced irrelevant packets. The debug log showed why:
 
 ```
 [final 0.0492] apollo-packet         (rank 1 in all channels)
@@ -377,59 +302,48 @@ I drew the new flow as a Mermaid sequence diagram in `TDS.md` *before* writing a
 [final 0.0469] hr-policy-packet      (totally irrelevant)
 ```
 
-The perfect-match packet scored `0.0492`. A genuinely irrelevant packet scored `0.0469`. The gap between them was `0.002`. The `retrieval_threshold` knob couldn't possibly help — every packet was scoring in the same narrow band.
-
-I went to the math. RRF's default `k = 60` is tuned for IR corpora of millions of documents. At my scale, the rank-1 vs rank-N contribution gap was vanishing. Two changes in `TDS.md`:
-
-- `hybrid_search_k: 60 → 2`. Sharpens the per-rank contribution.
-- Per-channel zero-score filtering. A packet with zero BM25 in a channel doesn't get a rank — it contributes 0 instead of inheriting noise.
-
-After:
+A 0.002 gap between the perfect match and irrelevant ones. `k = 60` (RRF's default for million-doc corpora) was over-compressing at personal scale. Two TDS changes — `k = 60 → 2`, and per-channel zero-score filtering — and after:
 
 ```
 [final 1.0000] apollo-packet         (rank 1 in all three channels)
-[final 0.2500] kubernetes-packet     (some cosine — Apollo runs on k8s, weak link — no BM25 overlap)
 [final 0.0000] postgres-packet       (filtered everywhere)
-[final 0.0000] hr-policy-packet      (filtered everywhere)
 ```
 
-Sharp separation. `retrieval_threshold` does something meaningful again.
-
-The architecture you've been reading about is the post-iteration version. None of the three changes was structural — they were all *refinements*. But each emerged from running the system, observing its behavior, and updating the TDS *before* the code.
+None of the three changes was a structural rebuild. Each was a refinement caught by running the system, observing it, and updating the TDS first.
 
 ## Observability is what made the iterations possible
 
-I caught the RRF compression in about thirty seconds — not because I read the code, but because I watched the debug output. That trick generalizes, and it's the discipline that pairs with TDS-first.
+The RRF compression took thirty seconds to catch — not because I read the code, but because I watched the debug output. That trick generalizes.
 
-Coco has two observability layers:
+Coco has two layers:
 
-- **Langfuse traces every LLM call.** Each `chat_turn` is one trace; all turns of one conversation group under a single Langfuse session. I can scroll a session and see exactly what was extracted on each partial, what packets were loaded, what the reply LLM had in its prompt, what came back. When something feels off, the trace tells me where it broke.
-- **A developer-mode toggle** (`debug_print_streaming: true` in `config.json`) prints the per-channel RRF breakdown to the console in real time — raw scores, ranks, contributions. The compression issue came from staring at that output for one minute.
+- **Langfuse traces every LLM call.** Each `chat_turn` is a trace; all turns of one conversation group under a single session. When something feels off, the trace shows what was extracted, what packets loaded, what the reply LLM saw.
+- **A developer-mode toggle** prints the per-channel RRF breakdown to the console as you type. That's where the compression issue surfaced.
 
-In end-user mode (the default), Coco shows just a clean welcome banner, a colored prompt, and the streamed reply. But it also surfaces tiny dim hints — `recalling: <gist>` and `remembered: <gist>` — so the user can see the memory layer moving. Even those minimal hints catch the occasional "wait, why did it remember *that*?" moment.
+End-user mode shows just the conversation and dim `recalling:` / `remembered:` hints so the memory layer is visible without being noisy.
 
-Skip observability in an AI-built system and you've built a black box that the AI also can't see into. That's strictly worse than handwritten code — at least handwritten code has an author who remembers their intent.
+Skip observability in an AI-built system and you have a black box that the AI also can't see into. That's strictly worse than handwritten code — at least handwritten code has an author who remembers their intent.
 
 ## Where AI gets it wrong (and you need to catch it)
 
-A few honest moments where the AI tripped during the Coco build:
+A few honest moments from the Coco build:
 
-- **Hallucinated SDK methods.** When I switched from `claude-agent-sdk` to the direct `anthropic` SDK, the first attempt called methods that didn't quite exist in the installed version. I had to grep the SDK and correct.
-- **Subtle async bugs.** The streaming "fire-and-forget partials, drain on submit" pattern took two passes to get right. The first version dropped events on fast typing.
-- **Bias toward over-engineering.** Without an explicit constraint, the AI suggested helper modules and abstractions I didn't ask for. I cut a lot. The TDS is also where you say *what doesn't exist*.
+- **Hallucinated SDK methods.** When I switched to the direct `anthropic` SDK, the first attempt called methods that didn't quite exist in the installed version.
+- **Subtle async bugs.** The streaming "fire-and-forget partials, drain on submit" pattern took two passes to get right.
+- **Bias toward over-engineering.** Without an explicit constraint, the AI suggested helper modules and abstractions I didn't ask for. The TDS is also where you say *what doesn't exist*.
 
-None of these are show-stoppers. All of them get caught by reading the diff, running the code, and reading the traces. Specs-first doesn't remove failure modes — it makes them quick and visible.
+None are show-stoppers. All get caught by reading the diff, running the code, and reading the traces. Specs-first doesn't remove failure modes — it makes them quick and visible.
 
 ## Two takeaways
 
-If you've read this far, you've absorbed two things that I hope feel orthogonal but are actually the same.
+Two things — orthogonal-feeling but actually the same.
 
-**One: a concrete architecture for a real-time self-learning agent.** Topic-scoped *packets* with multi-facet retrieval handles, an entity bag for direct lookups, multi-fidelity content gated by dynamic strength, and a streaming extraction layer that retrieves *before* you press Enter. The math behind retrieval is simple (3-channel RRF with zero-score filtering, `k = 2`); the math behind strength is simple (decaying weighted sum). The whole system is under 2000 lines of Python. It feels alive because every design choice — multi-facet, multi-fidelity, strength dynamics, streaming — was made on purpose to map onto how memory actually behaves.
+**One: a concrete architecture for a real-time self-learning agent.** Topic-scoped *packets* with multi-facet retrieval handles, an entity bag for direct lookups, multi-fidelity content gated by dynamic strength, and a streaming extraction layer that retrieves *before* you press Enter. The math is simple — 3-channel RRF with zero-score filtering at `k = 2`, plus a decaying weighted sum for strength. Under 2000 lines of Python.
 
 **Two: an AI engineering workflow that delivers it.** Don't ask the AI to "build a self-learning agent." Specify the variant. Capture the conceptual design in `DESIGN.md`. Derive a `TDS.md` with module signatures, data shapes, and sequence diagrams. Update the TDS *first*, then the code. Wire observability before features. Read the traces.
 
-The second one is what made the first one possible. A year ago I would have produced the generic agent the AI offered me first, called it done, and never noticed that the median interpretation wasn't what I wanted. The TDS-first discipline is what let me iterate from a median first draft to a specific architecture without producing tech debt at every turn. AI is a force multiplier — and a multiplier on zero is still zero.
+AI is a force multiplier — and a multiplier on zero is still zero. The TDS-first discipline is what let me iterate from a generic first draft to a specific architecture without producing tech debt at every turn.
 
-None of this means vibe coding is always wrong — for throwaway scripts, learning a new library, and spike-and-discard exploration, it's exactly the right tool. The discipline above kicks in when the system has any meaningful lifespan, when there's real state to manage, or when anyone else might need to read or extend what you built. A useful test: if you'd be embarrassed by it breaking at 2am, write the spec.
+None of this means vibe coding is always wrong — for throwaway scripts, learning a library, and spike-and-discard exploration, it's exactly the right tool. The discipline above kicks in when the system has any meaningful lifespan or when anyone else might read or extend what you built. A useful test: if you'd be embarrassed by it breaking at 2am, write the spec.
 
-If you're starting a new AI-assisted project this week, the one piece of advice I'd repeat: don't ask the AI to "build X." Specify the variant. Write it down. *Then* open any `.py` file.
+Don't ask the AI to "build X." Specify the variant. Write it down. *Then* open any `.py` file.
