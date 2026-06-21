@@ -17,7 +17,7 @@ The economics are different — minutes of compute, not millions of dollars — 
 
 This post is a worked example. I wanted a self-learning conversational agent — something that would remember what we talked about the way a person does, surface it back without being asked, and feel instant. My first prompt — *"help me build a self-learning conversational agent"* — produced something perfectly competent and entirely generic. A chat loop with conversation history. A vector store of documents. Some RAG. All the canonical pieces of "AI memory" circa 2025. Useful. Also exactly nothing like what I wanted.
 
-What follows is what I did instead: how I figured out which variant I actually wanted, what the architecture turned out to be, and how I worked with the AI to build it. The two halves — *what to build* and *how to build it with an AI* — turn out to be the same skill.
+What follows is how I figured out which variant I actually wanted, what the architecture turned out to be, and how I worked with the AI to build it — two halves that turn out to be the same skill.
 
 ## The thousand variants
 
@@ -416,20 +416,9 @@ A few honest moments where the AI tripped during the Coco build:
 
 - **Hallucinated SDK methods.** When I switched from `claude-agent-sdk` to the direct `anthropic` SDK, the first attempt called methods that didn't quite exist in the installed version. I had to grep the SDK and correct.
 - **Subtle async bugs.** The streaming "fire-and-forget partials, drain on submit" pattern took two passes to get right. The first version dropped events on fast typing.
-- **Mermaid syntax landmines.** The AI happily produced sequence diagrams with semicolons in arrow messages and em-dashes in notes — both of which break GitHub's Mermaid parser. I had to teach it via the TDS the safe character set.
 - **Bias toward over-engineering.** Without an explicit constraint, the AI suggested helper modules and abstractions I didn't ask for. I cut a lot. The TDS is also where you say *what doesn't exist*.
 
 None of these are show-stoppers. All of them get caught by reading the diff, running the code, and reading the traces. Specs-first doesn't remove failure modes — it makes them quick and visible.
-
-## When vibe coding is still the right call
-
-Before you over-correct, an honest caveat. Vibe coding is genuinely the right tool for:
-
-- **Throwaway scripts** — a one-off CSV transform, a Friday-afternoon Slack bot.
-- **Learning a new library** — prompting through a prototype is faster than fighting a TDS while you're still figuring out the API surface.
-- **Spike-and-discard exploration** — when you don't yet know enough to write a useful spec.
-
-A useful test: if you'd be embarrassed by it breaking at 2am, write the spec.
 
 ## Two takeaways
 
@@ -441,12 +430,6 @@ If you've read this far, you've absorbed two things that I hope feel orthogonal 
 
 The second one is what made the first one possible. A year ago I would have produced the generic agent the AI offered me first, called it done, and never noticed that the median interpretation wasn't what I wanted. The TDS-first discipline is what let me iterate from a median first draft to a specific architecture without producing tech debt at every turn. AI is a force multiplier — and a multiplier on zero is still zero.
 
-## Try Coco
-
-The repo is at [github.com/shishircc/self-learning-knowledge-agent](https://github.com/shishircc/self-learning-knowledge-agent). `DESIGN.md` and `TDS.md` sit alongside the code, exactly as they were used during the build. If you want to see the workflow concretely:
-
-- Read `DESIGN.md` for the architecture rationale — every choice has a paragraph of reasoning.
-- Skim `TDS.md` §7.1 for the full streaming sequence diagram and the module-by-module reference.
-- Flip `debug_print_streaming: true` in `config.json` and run it. Watch the per-channel scoring as you type.
+None of this means vibe coding is always wrong — for throwaway scripts, learning a new library, and spike-and-discard exploration, it's exactly the right tool. The discipline above kicks in when the system has any meaningful lifespan, when there's real state to manage, or when anyone else might need to read or extend what you built. A useful test: if you'd be embarrassed by it breaking at 2am, write the spec.
 
 If you're starting a new AI-assisted project this week, the one piece of advice I'd repeat: don't ask the AI to "build X." Specify the variant. Write it down. *Then* open any `.py` file.
