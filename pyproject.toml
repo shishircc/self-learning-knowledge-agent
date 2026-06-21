@@ -1,0 +1,25 @@
+[project]
+name = "coco"
+version = "0.1.0"
+description = "A self-learning conversational agent"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.40.0",
+    "sentence-transformers>=2.7.0",
+    "rank-bm25>=0.2.2",
+    "numpy>=1.26.0",
+    "dotenv>=0.9.9",
+    "langfuse>=4.0.0",
+    "prompt_toolkit>=3.0.0",
+]
+
+[project.scripts]
+coco = "coco.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["coco*"]
