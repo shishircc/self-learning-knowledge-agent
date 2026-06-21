@@ -1,4 +1,4 @@
-# Using Good AI Engineering process to Build Coco, A Self Learning Knowledge Agent
+# When Vibe Coding Hits a Wall: The AI Engineering Workflow Behind Coco, a Real-Time Self-Learning Knowledge Agent
 
 *A walk-through of Coco: a conversational agent that builds long-term memory while you type, organizes it as multi-link knowledge packets, and retrieves it under 100ms — plus the engineering workflow that made building it actually possible.*
 
