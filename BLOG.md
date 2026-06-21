@@ -19,6 +19,25 @@ This post is a worked example. I wanted a self-learning conversational agent —
 
 What follows is what I did instead: how I figured out which variant I actually wanted, what the architecture turned out to be, and how I worked with the AI to build it. The two halves — *what to build* and *how to build it with an AI* — turn out to be the same skill.
 
+## A map of what's ahead
+
+This post is long because it tries to do two things at once: walk through a specific architecture in enough depth that you could build something similar, and walk through the AI-assisted engineering workflow that produced it. The order:
+
+1. **Why "build me a self-learning agent" failed.** The median-answer problem, and the six concrete requirements that turned an underspecified ask into a tractable design problem.
+2. **A mental model from how humans remember.** The four-line bridge from "how memory feels" to a data structure.
+3. **The AI engineering workflow.** `DESIGN.md` → `TDS.md` → code, with a loop driven by observability. A text-based flow diagram makes the loop concrete.
+4. **Try it yourself in four commands.** If you'd rather pull and run Coco than read about it.
+5. **The architecture** — the meat of the post:
+   - Topic-scoped *packets* with multi-facet retrieval handles.
+   - Three-channel hybrid retrieval (BM25 on topics, max-cosine on topic vectors, BM25 on the entity bag), fused by Reciprocal Rank Fusion.
+   - Streaming triggers that retrieve *while you type*, with novelty gates and a small fast LM.
+   - A write path that consolidates new knowledge via a scratchpad.
+   - Decaying strength dynamics that make the system feel alive (and gate multi-fidelity content).
+6. **How the architecture actually emerged.** Three iterations against a running system — multi-facet packets, streaming retrieval, the RRF compression fix — that produced the design above.
+7. **Lessons.** Observability as the load-bearing partner to specs; where AI gets it wrong; when vibe coding is still the right call; two takeaways.
+
+If you only want the architecture, jump to "The packet." If you only want the workflow, sections 3 and 6 are the dense part. If you want both, read straight through — they're the same skill.
+
 ## The thousand variants
 
 The phrase *"self-learning conversational agent"* describes a thousand different systems. RAG over uploaded documents. Long-term conversation history with summarization. Episodic journaling. Knowledge graphs with typed edges. Vector memory with topic clustering. Reinforcement-learned chat. Persistent agent loops with reflection. Each of those is "self-learning" by some definition.
