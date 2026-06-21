@@ -19,25 +19,6 @@ This post is a worked example. I wanted a self-learning conversational agent —
 
 What follows is what I did instead: how I figured out which variant I actually wanted, what the architecture turned out to be, and how I worked with the AI to build it. The two halves — *what to build* and *how to build it with an AI* — turn out to be the same skill.
 
-## A map of what's ahead
-
-This post is long because it tries to do two things at once: walk through a specific architecture in enough depth that you could build something similar, and walk through the AI-assisted engineering workflow that produced it. The order:
-
-1. **Why "build me a self-learning agent" failed.** The median-answer problem, and the six concrete requirements that turned an underspecified ask into a tractable design problem.
-2. **A mental model from how humans remember.** The four-line bridge from "how memory feels" to a data structure.
-3. **The AI engineering workflow.** `DESIGN.md` → `TDS.md` → code, with a loop driven by observability. A text-based flow diagram makes the loop concrete.
-4. **Try it yourself in four commands.** If you'd rather pull and run Coco than read about it.
-5. **The architecture** — the meat of the post:
-   - Topic-scoped *packets* with multi-facet retrieval handles.
-   - Three-channel hybrid retrieval (BM25 on topics, max-cosine on topic vectors, BM25 on the entity bag), fused by Reciprocal Rank Fusion.
-   - Streaming triggers that retrieve *while you type*, with novelty gates and a small fast LM.
-   - A write path that consolidates new knowledge via a scratchpad.
-   - Decaying strength dynamics that make the system feel alive (and gate multi-fidelity content).
-6. **How the architecture actually emerged.** Three iterations against a running system — multi-facet packets, streaming retrieval, the RRF compression fix — that produced the design above.
-7. **Lessons.** Observability as the load-bearing partner to specs; where AI gets it wrong; when vibe coding is still the right call; two takeaways.
-
-If you only want the architecture, jump to "The packet." If you only want the workflow, sections 3 and 6 are the dense part. If you want both, read straight through — they're the same skill.
-
 ## The thousand variants
 
 The phrase *"self-learning conversational agent"* describes a thousand different systems. RAG over uploaded documents. Long-term conversation history with summarization. Episodic journaling. Knowledge graphs with typed edges. Vector memory with topic clustering. Reinforcement-learned chat. Persistent agent loops with reflection. Each of those is "self-learning" by some definition.
@@ -168,7 +149,26 @@ python -m coco
 
 That gives you a colored prompt, a streaming reply, and brief `recalling:` / `remembered:` hints as the memory layer moves. Flip `debug_print_streaming: true` in `config.json` if you want to watch the per-channel RRF breakdown live while you type — that's the developer-mode view I used to catch the scoring issue you'll read about later.
 
-## The packet
+## A map of the rest
+
+The remainder of this post does two things: walks through Coco's architecture in enough depth that you could build something similar, and shows the iterations that produced it.
+
+1. **Architecture** — the meat of the post. Five components, then the iterations that shaped them:
+   - **The packet** — topic-scoped knowledge with multi-facet retrieval handles and an entity list.
+   - **Retrieval** — three-channel hybrid (BM25 on topics, max-cosine on topic vectors, BM25 on the entity bag), fused by Reciprocal Rank Fusion with zero-score filtering.
+   - **Real-time** — streaming triggers that retrieve *while you type*, with novelty gates and a small fast LM.
+   - **The write path** — how new knowledge gets stored, via a scratchpad consolidation layer.
+   - **Strength** — decaying weighted activity that makes the system feel alive (and gates multi-fidelity content).
+   - **How the architecture actually emerged** — three iterations against a running system that produced the shape above.
+2. **Lessons** — observability as the load-bearing partner to specs; where AI gets it wrong; when vibe coding is still the right call; two takeaways.
+
+If you only want the architecture, the next section is where it starts. If you only want the workflow, jump to "How the architecture actually emerged" and then the lessons.
+
+## Architecture
+
+Six pieces, in the order that makes them easiest to understand. Packets first (the data structure that everything else operates on), then how retrieval works against them, then how retrieval gets triggered in real time, then how new knowledge gets written back, then how strength makes the whole thing dynamic — and finally a walk through the three iterations that shaped this design.
+
+### The packet
 
 The atomic unit of long-term memory in Coco is a **packet**. It's not a document chunk. It's a unit of related knowledge — typically a person, a project, a procedure, or a topic. Think of it as a node in a personal wiki, but smaller and more dynamic.
 
@@ -198,7 +198,7 @@ Each field exists for a specific reason.
 
 This shape is what "multi-link, real-time knowledge memory" actually looks like at a data level. Now: how do you retrieve it?
 
-## Retrieval: three channels, fused by rank
+### Retrieval: three channels, fused by rank
 
 Given a conversational moment — say, you've just typed "I need to check on the Apollo rollout" — how does the system find the right packet?
 
@@ -233,7 +233,7 @@ Sharp separation. Combined with zero-score filtering, an irrelevant packet lands
 
 A small per-packet strength bias gets added on top — packets you've used a lot recently bias slightly higher, but a sharp semantic match can still surface a packet you haven't touched in months. This keeps retrieval responsive without becoming a popularity contest.
 
-## Real-time: retrieving while you type
+### Real-time: retrieving while you type
 
 Here's where it stops feeling like a chatbot and starts feeling like an agent.
 
@@ -303,7 +303,7 @@ Two design notes about this flow.
 
 The conversational effect is striking. You type a question; tokens of the reply start arriving in under a second; the right memories are already there. It doesn't feel like a chatbot with a memory hack. It feels like talking to something that knows you.
 
-## The write path: how knowledge actually gets stored
+### The write path: how knowledge actually gets stored
 
 Every turn potentially produces new knowledge. The agent has to decide where it goes.
 
@@ -332,7 +332,7 @@ The **scratchpad** is the consolidation layer. Stuff that's mentioned once but i
 
 The economic reason this matters: not every passing mention deserves long-term memory. Without the scratchpad layer, the agent would either accumulate noise (every utterance becomes a packet) or miss things (a meaningful detail mentioned briefly never gets captured). The scratchpad is the buffer that gives the system *judgment* about what to keep.
 
-## Strength: the system feels alive
+### Strength: the system feels alive
 
 Strength is what makes the difference between a static knowledge base and a dynamic memory.
 
@@ -355,7 +355,7 @@ Three event types: every retrieval adds 1 (you considered the packet), every "us
 
 The math is trivially cheap. The behavior is that the system *feels alive*: packets you stop using gracefully demote out of the strong tier without disappearing, and the moment you start using them again they ramp back up. There's no global garbage collection, no manual archival — just a single weighted log per packet.
 
-## How the architecture actually emerged
+### How the architecture actually emerged
 
 The architecture above didn't come from one design session. It emerged through three iterations against a running system, using the workflow described earlier — `DESIGN.md` → `TDS.md` with sequence diagrams → AI implements → run + observe → update TDS → AI updates code. Each iteration had the same shape: I observed a problem, went back to the TDS, the code change followed.
 
