@@ -1,9 +1,17 @@
 import json
+import re
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 import numpy as np
+
+if TYPE_CHECKING:
+    from .auth import Identity
+
+
+_COCO_IMG_REF_RE = re.compile(r"coco-img:(img_[0-9a-f]+)")
 
 
 def now_iso() -> str:
@@ -19,6 +27,134 @@ class PacketContent:
     gist: str = ""
     summary: str = ""
     full: str = ""
+
+
+@dataclass
+class PacketImage:
+    id: str
+    alt: str | None
+    mime: str
+    data_b64: str
+    dimensions: list  # [w, h]
+    source_url: str | None = None
+    added_at: str = ""
+
+    @classmethod
+    def new(
+        cls,
+        alt: str | None,
+        mime: str,
+        data_b64: str,
+        dimensions,
+        source_url: str | None = None,
+    ) -> "PacketImage":
+        if dimensions is None:
+            dims_list = [0, 0]
+        else:
+            dims_list = [int(dimensions[0]), int(dimensions[1])]
+        return cls(
+            id=new_id("img"),
+            alt=alt,
+            mime=mime,
+            data_b64=data_b64,
+            dimensions=dims_list,
+            source_url=source_url,
+            added_at=now_iso(),
+        )
+
+    @property
+    def data_uri(self) -> str:
+        return f"data:{self.mime};base64,{self.data_b64}"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PacketImage":
+        return cls(
+            id=d["id"],
+            alt=d.get("alt"),
+            mime=d["mime"],
+            data_b64=d["data_b64"],
+            dimensions=list(d.get("dimensions") or [0, 0]),
+            source_url=d.get("source_url"),
+            added_at=d.get("added_at", ""),
+        )
+
+
+@dataclass
+class PacketSource:
+    """Provenance record for one write into a packet.
+
+    `effective_authoritativeness = max(role_authoritativeness, domain_authoritativeness or 0)`
+    is computed at construction time so the trust scalar is recorded as it
+    was at write time (config changes later don't retroactively shift it).
+    """
+
+    type: str  # "url" | "conversation"
+    url: str | None = None
+    domain_authoritativeness: float | None = None
+    speaker_name: str | None = None
+    speaker_email: str | None = None
+    speaker_role: str | None = None
+    role_authoritativeness: float = 0.0
+    effective_authoritativeness: float = 0.0
+    recorded_at: str = ""
+
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        domain_authoritativeness: float | None,
+        writer: "Identity",
+    ) -> "PacketSource":
+        role_auth = float(writer.role_authoritativeness or 0.0)
+        d_auth = float(domain_authoritativeness or 0.0)
+        return cls(
+            type="url",
+            url=url,
+            domain_authoritativeness=d_auth,
+            speaker_name=writer.name,
+            speaker_email=writer.email,
+            speaker_role=writer.role,
+            role_authoritativeness=role_auth,
+            effective_authoritativeness=max(role_auth, d_auth),
+            recorded_at=now_iso(),
+        )
+
+    @classmethod
+    def from_conversation(cls, writer: "Identity") -> "PacketSource":
+        role_auth = float(writer.role_authoritativeness or 0.0)
+        return cls(
+            type="conversation",
+            url=None,
+            domain_authoritativeness=None,
+            speaker_name=writer.name,
+            speaker_email=writer.email,
+            speaker_role=writer.role,
+            role_authoritativeness=role_auth,
+            effective_authoritativeness=role_auth,
+            recorded_at=now_iso(),
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PacketSource":
+        return cls(
+            type=d.get("type", "conversation"),
+            url=d.get("url"),
+            domain_authoritativeness=d.get("domain_authoritativeness"),
+            speaker_name=d.get("speaker_name"),
+            speaker_email=d.get("speaker_email"),
+            speaker_role=d.get("speaker_role"),
+            role_authoritativeness=float(d.get("role_authoritativeness", 0.0) or 0.0),
+            effective_authoritativeness=float(
+                d.get("effective_authoritativeness", 0.0) or 0.0
+            ),
+            recorded_at=d.get("recorded_at", ""),
+        )
 
 
 @dataclass
@@ -47,6 +183,9 @@ class Packet:
     created_at: str = ""
     updated_at: str = ""
     source_session_ids: list = field(default_factory=list)
+    sources: list = field(default_factory=list)  # list[PacketSource]
+    authoritativeness: float = 0.0
+    images: list = field(default_factory=list)  # list[PacketImage]
 
     @classmethod
     def new(
@@ -56,13 +195,15 @@ class Packet:
         gist: str = "",
         summary: str = "",
         full: str = "",
+        sources: list | None = None,
+        images: list | None = None,
     ):
         ts = now_iso()
         facets = [
             TopicFacet(text=t, vector=(v.tolist() if hasattr(v, "tolist") else list(v)))
             for t, v in topics
         ]
-        return cls(
+        pkt = cls(
             id=new_id("pkt"),
             topics=facets,
             entities=[e.lower().strip() for e in entities if e and e.strip()],
@@ -71,7 +212,15 @@ class Packet:
             created_at=ts,
             updated_at=ts,
             source_session_ids=[],
+            sources=[],
+            authoritativeness=0.0,
+            images=[],
         )
+        for src in sources or []:
+            pkt.add_source(src)
+        for img in images or []:
+            pkt.add_image(img)
+        return pkt
 
     def topic_texts(self) -> list[str]:
         return [t.text for t in self.topics]
@@ -110,6 +259,67 @@ class Packet:
             "weight": weight,
         })
 
+    def add_source(self, source: PacketSource) -> bool:
+        """Append `source` to `sources`; recompute authoritativeness (monotone-up).
+
+        Returns True on append. URL-source dedupe is the caller's responsibility
+        (use `has_source_url(url)` first); this method always appends so the
+        audit trail of write events stays intact.
+        """
+        if not isinstance(source, PacketSource):
+            return False
+        self.sources.append(source)
+        eff = float(source.effective_authoritativeness or 0.0)
+        if eff > self.authoritativeness:
+            self.authoritativeness = eff
+        return True
+
+    def has_source_url(self, url: str) -> bool:
+        if not url:
+            return False
+        u = url.strip().lower()
+        for s in self.sources:
+            if s.type == "url" and s.url and s.url.strip().lower() == u:
+                return True
+        return False
+
+    def source_urls(self) -> list[str]:
+        """Derived: distinct URLs across `sources`, in first-seen order."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for s in self.sources:
+            if s.type != "url" or not s.url:
+                continue
+            key = s.url.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s.url)
+        return out
+
+    def add_image(self, image: PacketImage) -> bool:
+        """Append an image. No-op if an image with the same id already exists."""
+        if not isinstance(image, PacketImage):
+            return False
+        if any(existing.id == image.id for existing in self.images):
+            return False
+        self.images.append(image)
+        return True
+
+    def image_by_id(self, image_id: str) -> PacketImage | None:
+        for img in self.images:
+            if img.id == image_id:
+                return img
+        return None
+
+    def referenced_image_ids(self) -> set[str]:
+        """All image ids appearing as `coco-img:img_<id>` inside content.full."""
+        return set(_COCO_IMG_REF_RE.findall(self.content.full or ""))
+
+    def unreferenced_image_ids(self) -> set[str]:
+        refs = self.referenced_image_ids()
+        return {img.id for img in self.images if img.id not in refs}
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -120,10 +330,44 @@ class Packet:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "source_session_ids": self.source_session_ids,
+            "sources": [s.to_dict() for s in self.sources],
+            "authoritativeness": self.authoritativeness,
+            "images": [img.to_dict() for img in self.images],
         }
 
     @classmethod
     def from_dict(cls, d: dict):
+        # Backwards-compat: legacy packets have `source_urls: list[str]` and no
+        # `sources` / `authoritativeness`. Synthesize neutral-trust PacketSource
+        # entries so URL lookups still work; trust starts at 0.0.
+        raw_sources = d.get("sources")
+        if raw_sources is None:
+            sources = []
+            for u in d.get("source_urls") or []:
+                if not isinstance(u, str) or not u.strip():
+                    continue
+                sources.append(PacketSource(
+                    type="url",
+                    url=u.strip(),
+                    domain_authoritativeness=0.0,
+                    speaker_name=None,
+                    speaker_email=None,
+                    speaker_role=None,
+                    role_authoritativeness=0.0,
+                    effective_authoritativeness=0.0,
+                    recorded_at="",
+                ))
+        else:
+            sources = [PacketSource.from_dict(s) for s in raw_sources]
+
+        authoritativeness = float(d.get("authoritativeness", 0.0) or 0.0)
+        if sources and authoritativeness == 0.0:
+            # Recompute aggregate from sources if absent in the JSON.
+            authoritativeness = max(
+                (float(s.effective_authoritativeness or 0.0) for s in sources),
+                default=0.0,
+            )
+
         return cls(
             id=d["id"],
             topics=[TopicFacet.from_dict(t) for t in d["topics"]],
@@ -133,6 +377,9 @@ class Packet:
             created_at=d.get("created_at", ""),
             updated_at=d.get("updated_at", ""),
             source_session_ids=d.get("source_session_ids", []),
+            sources=sources,
+            authoritativeness=authoritativeness,
+            images=[PacketImage.from_dict(x) for x in d.get("images", [])],
         )
 
 
@@ -202,6 +449,27 @@ class PacketStore:
 
     def all(self) -> list[Packet]:
         return list(self.packets.values())
+
+    def find_by_source_url(self, url: str) -> Packet | None:
+        if not url:
+            return None
+        for p in self.packets.values():
+            if p.has_source_url(url):
+                return p
+        return None
+
+    def find_image(self, image_id: str) -> tuple[Packet, PacketImage] | None:
+        """Locate an image by id across all packets — used by downstream UIs.
+
+        Linear scan; fine at personal scale.
+        """
+        if not image_id:
+            return None
+        for p in self.packets.values():
+            img = p.image_by_id(image_id)
+            if img is not None:
+                return p, img
+        return None
 
 
 class Scratchpad:

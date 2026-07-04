@@ -2,6 +2,27 @@ import json
 import re
 
 
+INGEST_SYSTEM_ADDENDUM = """
+
+—— INGEST MODE ——
+The user asked you to read one or more URLs into your long-term memory. The fetched content sits in the user message inside <fetched_sources>...</fetched_sources>. Each source carries:
+  <source url="..."><markdown>page content with [IMG_n] image placeholders</markdown><images>manifest of available [IMG_n] tokens with alt text and dimensions</images></source>
+
+The actual image bytes for each [IMG_n] are attached to this user message as separate `image` content blocks — you can SEE them as well as read their alt text. Use the visual content to judge whether each image is content-bearing (charts, diagrams, key photos worth keeping in memory) vs decorative (icons, logos, hero stock photos, social-share widgets).
+
+Your job in ingest mode:
+1. Reply conversationally — like a friend who just read the page. Acknowledge what you read (refer to the title or the URL host) and give 2-3 concrete takeaways. Keep it tight.
+2. For storage, emit one or more `new_knowledge` items in <metadata>. Each item carries:
+   - "content": the cleaned-up markdown worth keeping. Reference images you want to keep by their `[IMG_n]` token VERBATIM (with brackets) wherever they belong in the prose. Only include images that are content-bearing. OMIT decorative ones.
+   - "source_url": the URL the content came from — copy it verbatim from <source url="...">.
+   - "implied_topic": a short (<=10 word) categorical phrase for what the content is about; will become a topic facet if a new packet is created.
+   - "conflicts_with": packet id if this contradicts a loaded packet, else null.
+   - "conflict_description": brief description on conflict.
+3. You may split a single page into multiple `new_knowledge` items if it covers distinct subjects (each lands in a topically appropriate packet).
+4. NEVER invent new `[IMG_n]` tokens that aren't in the manifest. After your reply the system mints a permanent `coco-img:img_<id>` reference for each [IMG_n] you kept and stores the bytes on the packet; stray tokens are dropped.
+5. `packets_used` lists loaded packets you drew on to contextualize your reply (often empty during ingest).
+"""
+
 SYSTEM_PROMPT_TEMPLATE = """You are Coco, a self-learning conversational assistant for {user_name}.
 
 You build long-term memory in the form of knowledge packets. Each packet has:
@@ -41,7 +62,7 @@ CRITICAL OUTPUT FORMAT — use these XML tags exactly, in this order:
 The user sees only what's inside <reply>...</reply>. The <metadata> block is for the agent and is parsed as JSON. Use empty arrays when applicable. Do not invent packet IDs."""
 
 
-EXTRACTION_PROMPT = """You are extracting topic and entities from an in-progress user message.
+EXTRACTION_PROMPT = """You are extracting topic, entities, and ingest intent from an in-progress user message.
 
 User text (may be partial or complete):
 ---
@@ -59,6 +80,12 @@ Your task:
 2. If substantive, identify a short topic_summary (up to 10 words) and a list of entities (proper nouns, names, places, named non-common nouns — lowercased).
 3. Decide whether the topic_summary introduces a NEW topic not already in the existing topics list above.
 4. Decide whether any of the entities introduce a NEW entity not already in the existing entities list above.
+5. Decide whether the user is asking the assistant to READ a URL into long-term memory. Set is_ingest_request=true ONLY when both apply:
+   (a) the text contains at least one http/https URL, AND
+   (b) the user expresses intent to have the assistant read, learn from, remember, ingest, or add the linked page to its knowledge.
+   Patterns that qualify: "read this", "go read", "ingest", "remember this page/site", "learn from", "add this to your knowledge", "absorb this", "study this", "save this site".
+   A bare URL with no verb does NOT qualify — that is just a reference, not an ingest request.
+   List all http/https URLs in `urls` regardless of intent; `is_ingest_request` gates the fetch.
 
 Output a single valid JSON object only (no prose, no fences):
 {{
@@ -67,13 +94,16 @@ Output a single valid JSON object only (no prose, no fences):
   "has_new_entities": true|false,
   "topic_summary": "<= 10 words" or null,
   "entities": ["entity1", "entity2"],
-  "reason": "niceties" | "too_short" | "too_generic" | "topic_continues" | "entities_overlap" | null
+  "is_ingest_request": true|false,
+  "urls": ["https://...", "..."],
+  "reason": "niceties" | "too_short" | "too_generic" | "topic_continues" | "entities_overlap" | "ingest_request" | null
 }}
 
 Rules:
 - If is_meaningful is false, also set has_new_topic=false, has_new_entities=false, topic_summary=null.
-- If is_meaningful is true but the topic continues an existing one AND no new entities are introduced, set has_new_topic=false, has_new_entities=false, reason="topic_continues" or "entities_overlap".
-- Set reason=null only when is_meaningful=true AND retrieval would be triggered.
+- An ingest request is always meaningful — when is_ingest_request=true, set is_meaningful=true and provide a topic_summary describing the page's likely subject (e.g. "Wikipedia article on Alka", "blog post on RRF tuning"); set reason="ingest_request".
+- If is_meaningful is true but the topic continues an existing one AND no new entities are introduced AND is_ingest_request=false, set has_new_topic=false, has_new_entities=false, reason="topic_continues" or "entities_overlap".
+- Set reason=null only when is_meaningful=true AND retrieval would be triggered AND not an ingest request.
 - Topic should be a STABLE CATEGORICAL phrase (e.g. "Shishir's family members", not "mom visiting next week"). Include disambiguating context where useful (e.g. "NCS strategy practice")."""
 
 
@@ -81,25 +111,42 @@ INTEGRATE_PROMPT = """You are integrating new knowledge into an existing knowled
 
 Existing topic facets: {existing_facets}
 Existing entities: {existing_entities}
+Existing source URLs: {existing_source_urls}
+Existing packet authoritativeness (trust of what's already in the packet): {existing_authoritativeness}
+
+Image manifest (all images attached to this packet, referenced from content via `![alt](coco-img:img_<id>)`):
+{image_manifest}
 
 Existing content (full):
 ---
 {existing_content}
 ---
 
-New knowledge to integrate:
+New knowledge to integrate{new_source_url_clause}:
+Writer role: {writer_role}
+New-write authoritativeness (trust of THIS incoming content): {new_authoritativeness}
 ---
 {new_content}
 ---
 
+Trust-driven conflict policy:
+- When existing and new content contradict each other on a fact, the source with the HIGHER authoritativeness wins.
+  • new_authoritativeness > existing_authoritativeness → the new claim REPLACES the existing one. Set trust_resolution="new_wins". conflict_detected=false.
+  • new_authoritativeness < existing_authoritativeness → preserve the existing claim; record the new one as a parenthetical alternate ("Some sources say X, though more authoritative sources say Y"). Set trust_resolution="existing_wins". conflict_detected=false.
+  • new_authoritativeness == existing_authoritativeness → keep both claims visible side-by-side and set trust_resolution="equal_escalate". Set conflict_detected=true so the system can escalate to the user.
+- Non-conflicting facts are merged normally regardless of trust.
+- If there is no conflict at all, set trust_resolution="new_wins" (it's a clean merge) and conflict_detected=false.
+
 Your task:
-1. Check whether the new content contradicts the existing content. If yes, flag the conflict.
-2. Produce a clean, integrated version of the content that incorporates the new knowledge, resolves redundancy, and stays coherent.
+1. Apply the trust-driven conflict policy and the normal merge for non-conflicts.
+2. Produce a clean, integrated `full` markdown that reflects (1).
 3. Update the topic-facets list. Add a new facet only if the new content opens a way to invoke the packet that isn't covered. Keep existing facets unless they've become wrong.
 4. Update the entities list to include any new proper nouns / names / places / named non-common nouns. Keep existing entities. Use lowercase.
+5. Image references take the form `![alt](coco-img:img_<id>)`. Preserve the ids in the manifest verbatim. You MAY drop a reference if the image is no longer relevant to the new prose; you MUST NOT invent new ids that aren't in the manifest above.
 
 Output a single JSON object only (no prose, no fences):
 {{
+  "trust_resolution": "new_wins" | "existing_wins" | "equal_escalate",
   "conflict_detected": true|false,
   "conflicting_excerpts": "describe what contradicts, or null",
   "gist": "one-line summary (under 15 words)",
@@ -112,7 +159,12 @@ Output a single JSON object only (no prose, no fences):
 
 NEW_PACKET_PROMPT = """You are creating a new knowledge packet from raw conversation excerpts.
 
-Seed topic (from scratchpad): "{seed_topic}"
+Seed topic: "{seed_topic}"
+{seed_source_url_clause}Writer role: {writer_role}
+Seed authoritativeness (trust of this seed content): {seed_authoritativeness}
+
+Seed image manifest (images attached to this packet at creation; reference them in your output via `![alt](coco-img:img_<id>)`):
+{image_manifest}
 
 Source excerpts:
 ---
@@ -123,6 +175,8 @@ Your task:
 1. Distill the excerpts into clean markdown content.
 2. Identify topic facets (1-3 to start) — distinct "ways someone might invoke this packet" (<=10 words each). Include the seed topic as one facet if it still applies.
 3. Identify entities — proper nouns, names, places, named non-common nouns. Lowercase them. Exclude generic words like "family", "wife", "week", "day".
+4. The seed content already contains `coco-img:img_<id>` references for any images attached. Preserve the ids verbatim; you may drop a reference if the image is purely decorative, but do not invent new ids.
+5. Phrase the gist and summary with appropriate hedging when seed_authoritativeness is low (≤ 0.3) — e.g. "Per the conversation, ..."; for high trust (≥ 0.8) state facts directly.
 
 Output a single JSON object only (no prose, no fences):
 {{
@@ -132,6 +186,21 @@ Output a single JSON object only (no prose, no fences):
   "topic_facets": ["facet1"],
   "entities": ["entity1"]
 }}"""
+
+
+def _format_packet_image_manifest_inline(images: list, indent: str = "    ") -> str:
+    """One line per image: `[img_<id>] alt="..." NNKB mime WxH`. Empty if no images."""
+    if not images:
+        return ""
+    lines = []
+    for img in images:
+        alt = (img.alt or "").replace("\n", " ").strip()
+        kb = max(1, len(img.data_b64 or "") * 3 // 4 // 1024)
+        w, h = (img.dimensions or [0, 0])[:2]
+        dim = f"{w}x{h}" if w and h else "vector"
+        mime_short = (img.mime or "").split("/")[-1]
+        lines.append(f'{indent}[{img.id}] alt={alt!r} {kb}KB {mime_short} {dim}')
+    return "\n".join(lines)
 
 
 def format_packets_for_prompt(loaded_packets: list[dict]) -> str:
@@ -144,32 +213,241 @@ def format_packets_for_prompt(loaded_packets: list[dict]) -> str:
         content = getattr(packet.content, slice_type)
         facets_str = ", ".join(f'"{t.text}"' for t in packet.topics)
         ents_str = ", ".join(packet.entities[:20])
+        src_urls_fn = getattr(packet, "source_urls", None)
+        src_urls = src_urls_fn() if callable(src_urls_fn) else (src_urls_fn or [])
+        src_line = ""
+        if src_urls:
+            src_line = f"  source_urls: {', '.join(src_urls[:5])}\n"
+        auth_val = float(getattr(packet, "authoritativeness", 0.0) or 0.0)
+        auth_line = f"  authoritativeness: {auth_val:.2f}\n" if auth_val > 0 else ""
+        images = getattr(packet, "images", []) or []
+        # Image manifest shown only for full-slice packets: those are the ones
+        # whose bytes get attached as multimodal blocks (see build_user_content_blocks).
+        img_line = ""
+        if images and slice_type == "full":
+            img_line = (
+                "  images (correlate with the image content blocks attached to "
+                "the user message):\n"
+                f"{_format_packet_image_manifest_inline(images, indent='    ')}\n"
+            )
         parts.append(
             f"--- packet id: {packet.id} | slice: {slice_type} ---\n"
             f"  facets: [{facets_str}]\n"
             f"  entities: [{ents_str}]\n"
+            f"{src_line}"
+            f"{auth_line}"
+            f"{img_line}"
             f"  content:\n{content}"
         )
     return "\n\n".join(parts)
 
 
-def build_system_prompt(loaded_packets: list[dict], user_name: str = "the user") -> str:
-    return SYSTEM_PROMPT_TEMPLATE.format(
+def build_system_prompt(
+    loaded_packets: list[dict],
+    user_name: str = "the user",
+    ingest_mode: bool = False,
+) -> str:
+    base = SYSTEM_PROMPT_TEMPLATE.format(
         user_name=user_name,
         loaded_packets=format_packets_for_prompt(loaded_packets),
     )
+    if ingest_mode:
+        return base + INGEST_SYSTEM_ADDENDUM
+    return base
 
 
-def build_user_message(history: list[dict], current_message: str) -> str:
-    if not history:
-        return current_message
-    lines = ["Recent conversation:"]
-    for turn in history:
-        role = "User" if turn["role"] == "user" else "Coco"
-        lines.append(f"{role}: {turn['content']}")
-    lines.append("")
-    lines.append(f"User now says: {current_message}")
+def _format_fetch_image_manifest(images: dict) -> str:
+    """One line per fetch-candidate image, keyed by [IMG_n]."""
+    if not images:
+        return "(no images available)"
+    lines = []
+    for key in sorted(images.keys()):
+        blob = images[key]
+        alt = (blob.alt or "").strip()
+        w, h = blob.dimensions
+        kb = max(1, blob.post_downscale_bytes // 1024)
+        dim_str = f"{w}x{h}" if w and h else "vector"
+        lines.append(
+            f"[{key}] alt={alt!r} {kb}KB {blob.mime.split('/')[-1]} {dim_str}"
+        )
     return "\n".join(lines)
+
+
+def _format_sources_block(fetch_results: list) -> str:
+    """Render <fetched_sources><source><markdown>...<images>...</source></fetched_sources>."""
+    if not fetch_results:
+        return ""
+    parts = ["<fetched_sources>"]
+    for fr in fetch_results:
+        title_attr = f' title="{fr.title}"' if fr.title else ""
+        truncated_attr = ' truncated="true"' if fr.truncated else ""
+        parts.append(f'  <source url="{fr.url}"{title_attr}{truncated_attr}>')
+        parts.append("    <markdown>")
+        parts.append(fr.markdown)
+        parts.append("    </markdown>")
+        parts.append("    <images>")
+        parts.append(_format_fetch_image_manifest(fr.images))
+        parts.append("    </images>")
+        parts.append("  </source>")
+    parts.append("</fetched_sources>")
+    return "\n".join(parts)
+
+
+# MIME types Anthropic accepts as `image` content blocks.
+_MULTIMODAL_MIMES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+
+def _make_image_block(media_type: str, data_b64: str) -> dict:
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": data_b64},
+    }
+
+
+def build_user_content_blocks(
+    history: list[dict],
+    current_message: str,
+    loaded_packets: list[dict] | None = None,
+    fetch_results: list | None = None,
+    failed_urls: list[tuple[str, str]] | None = None,
+    image_blocks_max: int | None = None,
+) -> list[dict]:
+    """Build a multimodal user-content list: one text block followed by image blocks.
+
+    Image blocks come from:
+      - loaded_packets at slice='full' (each PacketImage → one image block)
+      - fetch_results (each non-SVG ImageBlob → one image block)
+
+    If `image_blocks_max` is set and the total would exceed it, packet images
+    are dropped first (FIFO over the loaded_packets order), then fetch images.
+    The text block always reports the alt manifest of dropped images too, so
+    the LLM still knows they exist.
+    """
+    # --- text block ----------------------------------------------------------
+    lines: list[str] = []
+    if history:
+        lines.append("Recent conversation:")
+        for turn in history:
+            role = "User" if turn["role"] == "user" else "Coco"
+            lines.append(f"{role}: {turn['content']}")
+        lines.append("")
+    lines.append(f"User now says: {current_message}")
+    lines.append("")
+    if failed_urls:
+        lines.append("URLs that could not be fetched (mention briefly in your reply):")
+        for url, reason in failed_urls:
+            lines.append(f"  - {url}: {reason}")
+        lines.append("")
+    if fetch_results:
+        lines.append(_format_sources_block(fetch_results))
+
+    text_block = {"type": "text", "text": "\n".join(lines)}
+
+    # --- image blocks --------------------------------------------------------
+    # Collect candidates in priority order: fetch (decision-critical) first,
+    # then loaded-packet images. Trim packet images when over cap.
+    fetch_image_blocks: list[dict] = []
+    if fetch_results:
+        for fr in fetch_results:
+            for key in sorted(fr.images.keys()):
+                blob = fr.images[key]
+                if blob.mime in _MULTIMODAL_MIMES:
+                    fetch_image_blocks.append(_make_image_block(blob.mime, blob.data_b64))
+
+    packet_image_blocks: list[dict] = []
+    packet_image_drops: list[str] = []
+    if loaded_packets:
+        for item in loaded_packets:
+            if item.get("slice") != "full":
+                continue
+            packet = item["packet"]
+            for img in getattr(packet, "images", []) or []:
+                if img.mime in _MULTIMODAL_MIMES:
+                    packet_image_blocks.append(_make_image_block(img.mime, img.data_b64))
+
+    if image_blocks_max is not None and image_blocks_max >= 0:
+        # Fetch images stay; trim packet images from the end if over cap.
+        budget_for_packets = max(0, image_blocks_max - len(fetch_image_blocks))
+        if len(packet_image_blocks) > budget_for_packets:
+            packet_image_drops = [
+                f"(dropped {len(packet_image_blocks) - budget_for_packets} loaded-packet "
+                "image block(s) due to per-turn cap)"
+            ]
+            packet_image_blocks = packet_image_blocks[:budget_for_packets]
+        # Final hard cap (in case fetch images themselves blew past the limit)
+        all_blocks = fetch_image_blocks + packet_image_blocks
+        if len(all_blocks) > image_blocks_max:
+            all_blocks = all_blocks[:image_blocks_max]
+    else:
+        all_blocks = fetch_image_blocks + packet_image_blocks
+
+    if packet_image_drops:
+        text_block["text"] += "\n" + "\n".join(packet_image_drops)
+
+    return [text_block] + all_blocks
+
+
+def render_integrate_prompt(
+    existing_facets: str,
+    existing_entities: str,
+    existing_content: str,
+    existing_source_urls: list[str] | None,
+    existing_authoritativeness: float,
+    new_content: str,
+    new_source_url: str | None,
+    new_authoritativeness: float,
+    writer_role: str,
+    image_manifest_items: list | None = None,
+) -> str:
+    src_clause = (
+        f" (newly ingested from {new_source_url})"
+        if new_source_url
+        else ""
+    )
+    urls_str = ", ".join(existing_source_urls or []) if existing_source_urls else "(none)"
+    if image_manifest_items:
+        manifest_text = _format_packet_image_manifest_inline(image_manifest_items, indent="    ")
+    else:
+        manifest_text = "    (no images)"
+    return INTEGRATE_PROMPT.format(
+        existing_facets=existing_facets,
+        existing_entities=existing_entities,
+        existing_source_urls=urls_str,
+        existing_authoritativeness=f"{float(existing_authoritativeness):.2f}",
+        image_manifest=manifest_text,
+        existing_content=existing_content,
+        new_content=new_content,
+        new_source_url_clause=src_clause,
+        new_authoritativeness=f"{float(new_authoritativeness):.2f}",
+        writer_role=writer_role or "(unknown)",
+    )
+
+
+def render_new_packet_prompt(
+    seed_topic: str,
+    seed_content: str,
+    seed_source_url: str | None,
+    seed_authoritativeness: float,
+    writer_role: str,
+    image_manifest_items: list | None = None,
+) -> str:
+    clause = (
+        f'Source URL (newly ingested): {seed_source_url}\n'
+        if seed_source_url
+        else ""
+    )
+    if image_manifest_items:
+        manifest_text = _format_packet_image_manifest_inline(image_manifest_items, indent="    ")
+    else:
+        manifest_text = "    (no images)"
+    return NEW_PACKET_PROMPT.format(
+        seed_topic=seed_topic,
+        seed_content=seed_content,
+        seed_source_url_clause=clause,
+        seed_authoritativeness=f"{float(seed_authoritativeness):.2f}",
+        writer_role=writer_role or "(unknown)",
+        image_manifest=manifest_text,
+    )
 
 
 def extract_json_block(text: str) -> str:
@@ -213,8 +491,26 @@ def parse_coco_response(raw: str) -> dict:
     }
 
 
+_VALID_TRUST_RESOLUTIONS = {"new_wins", "existing_wins", "equal_escalate"}
+
+
 def parse_integration_response(raw: str) -> dict:
-    return json.loads(extract_json_block(raw))
+    d = json.loads(extract_json_block(raw))
+    # Normalize trust_resolution: must be one of the three documented values.
+    # When the LLM omits it, fall back to a sensible default that preserves
+    # the legacy "conflict → ask user" behaviour without crashing the path.
+    tr = d.get("trust_resolution")
+    if tr not in _VALID_TRUST_RESOLUTIONS:
+        tr = "equal_escalate" if d.get("conflict_detected") else "new_wins"
+    d["trust_resolution"] = tr
+    # When trust_resolution is anything except equal_escalate, conflict_detected
+    # must be false (the LLM is told this in the prompt, but a defensive clamp
+    # avoids accidental user prompts on auto-resolved merges).
+    if tr != "equal_escalate":
+        d["conflict_detected"] = False
+    else:
+        d["conflict_detected"] = bool(d.get("conflict_detected", True))
+    return d
 
 
 def parse_new_packet_response(raw: str) -> dict:
