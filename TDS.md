@@ -27,6 +27,7 @@ Sequence diagrams use [Mermaid](https://mermaid.js.org/) syntax — renderable i
     ├── agent.py               turn loop orchestration, LLM calls, write-path branching, ingest dispatch
     ├── auth.py                startup identity acquisition — anonymous + SSO (Entra, Google) + role resolution
     ├── config.py              defaults + JSON config loader
+    ├── document.py            document upload skill — streaming PDF/DOCX/PPTX reader + chunker + type detection
     ├── embeddings.py          sentence-transformers wrapper + cosine
     ├── fetch.py               URL ingestion skill — httpx + readability + markdownify + image processing
     ├── memory.py              Packet, ScratchpadEntry, TopicFacet, storage classes
@@ -68,7 +69,8 @@ Each module's public surface and its dependencies on other modules.
 | `ANONYMOUS` | `Identity` | `name="anonymous"`, `email=None`, `role="anonymous"`, `role_authoritativeness=0.0`, `capabilities=resolve_capabilities("anonymous", config)`, `provider="anonymous"`, `claims={}` |
 | `ROLE_AUTHORITATIVENESS` | `dict[str, float]` | `{"admin": 1.0, "author": 0.8, "viewer": 0.5, "user": 0.3, "anonymous": 0.0}`. Maps role string → trust scalar. Surfaced for `resolve_role` consumers. |
 | `resolve_domain_authoritativeness(url, config)` | sync → `float` | Longest-prefix match of `url`'s host + path against `config["domain_authoritativeness"]` (keys are domain or `domain/path-prefix`). Falls back to `config["default_domain_authoritativeness"]` (default `0.5`). Case-insensitive host match; path match is exact-prefix (no glob). Returns `0.0` only when the config explicitly maps the pattern to `0.0`. |
-| `effective_authoritativeness(role_auth, domain_auth)` | sync → `float` | Returns `max(role_auth, domain_auth or 0.0)`. The canonical computation used by both `_create_packet_from_seed` and `integrate_into_packet`. |
+| `resolve_file_authoritativeness(filename, config)` | sync → `float` | Longest-match of `filename` (and absolute path, if available) against `config["file_authoritativeness"]` keys. Keys can be filename globs (`*.draft.pdf`, `acme-handbook-*.pdf`) and/or path prefixes (`/policies/`). Path prefixes match a normalized absolute path; globs match the basename. Longest match wins; ties are broken by path-prefix > glob. Falls back to `config["default_file_authoritativeness"]` (default `0.5`). |
+| `effective_authoritativeness(role_auth, source_trust)` | sync → `float` | Returns `max(role_auth, source_trust or 0.0)`. Canonical computation used by `_create_packet_from_seed`, `integrate_into_packet`, and the document write-path. `source_trust` is whichever applies: `domain_authoritativeness` for URLs, `file_authoritativeness` for documents, `None`/`0` for plain conversation. |
 | `CAPABILITIES` | `frozenset[str]` | Known capability strings — see table below. Unknown capabilities found in config warn at startup and are ignored. |
 | `DEFAULT_ROLE_CAPABILITIES` | `dict[str, frozenset[str]]` | Hard-coded fallback applied when `config.auth.role_capabilities` is absent or missing an entry for a role. Matches the table in DESIGN.md §"Identity & roles". |
 | `acquire_identity(config)` | async → `Identity` | Top-level startup entry. Reads `config["auth"]` and drives the flow described below. Always returns a valid `Identity` (worst case `ANONYMOUS`). |
@@ -94,6 +96,7 @@ Each module's public surface and its dependencies on other modules.
 | `delete_packet` | Future `Packet.delete` (admin-only operation; not yet wired). |
 | `force_rewrite` | Future "rewrite full content without merge" path (admin-only). |
 | `skill.fetch_url` | The ingest dispatch in `_handle_ingest`. If absent and `is_ingest_request=true`, the fetch is skipped and Coco responds with the denial hint — no network call is made. |
+| `skill.upload_document` | The document-upload dispatch in `_handle_document_upload`. If absent and `is_upload_request=true`, no file is read; Coco surfaces the denial hint. |
 | `skill.<id>` | Future skills. Each skill registers its capability id (string) and the agent's skill-invocation site checks `session.user.can("skill.<id>")` before calling. |
 
 **`acquire_identity` flow:**
@@ -149,7 +152,7 @@ Each module's public surface and its dependencies on other modules.
 | `PacketContent` | `{gist: str, summary: str, full: str}`. `full` may contain `coco-img:<id>` references but never inline base64. |
 | `TopicFacet` | `{text: str, vector: list[float]}` + `vec_np()` |
 | `PacketImage` | `{id: str, alt: str | None, mime: str, data_b64: str, dimensions: tuple[int,int], source_url: str | None, added_at: str}`. Factory `PacketImage.new(alt, mime, data_b64, dimensions, source_url)` mints `img_<12-hex>` id. |
-| `PacketSource` | Provenance record. `{type: "url"\|"conversation", url: str\|None, domain_authoritativeness: float\|None, speaker_name: str\|None, speaker_email: str\|None, speaker_role: str\|None, role_authoritativeness: float, effective_authoritativeness: float, recorded_at: str}`. Factories `PacketSource.from_url(url, domain_auth, writer_identity)` and `PacketSource.from_conversation(writer_identity)`. |
+| `PacketSource` | Provenance record. `{type: "url"\|"conversation"\|"document", url, domain_authoritativeness, filename, document_type, page_number, paragraph_index, file_authoritativeness, speaker_*, role_authoritativeness, effective_authoritativeness, recorded_at}`. Factories `PacketSource.from_url(url, domain_auth, writer)`, `PacketSource.from_conversation(writer)`, and `PacketSource.from_document(filename, document_type, page_number, paragraph_index, file_auth, writer)`. |
 | `Packet` | Multi-facet packet with images + sources; see §3.1 |
 | `ScratchpadEntry` | Single-topic short-term entry; see §3.2 |
 | `PacketStore` | One-JSON-per-packet on disk; in-memory dict |
@@ -227,13 +230,13 @@ class Session:
 **Public API:**
 | Symbol | Notes |
 |---|---|
-| `SYSTEM_PROMPT_TEMPLATE` | Main reply prompt (`user_name`, `loaded_packets` slots). Topic classification is owned by streaming, not this prompt. Output format is XML-tagged so the reply can be streamed to the user as it's generated: `<reply>...</reply><metadata>{packets_used, new_knowledge}</metadata>`. See §5.4. |
+| `SYSTEM_PROMPT_TEMPLATE` | Main reply prompt (`user_name`, `loaded_packets` slots). Topic classification is owned by streaming, not this prompt. `user_name` is filled from `session.user.prompt_display_name()` — the acquired `Identity.name` for authenticated sessions, or the literal `"the user"` in anonymous mode (see §3.4). After SSO login Coco sees "…assistant for **Shishir Choudhary**…" from the very first turn. Output format is XML-tagged so the reply can be streamed to the user as it's generated: `<reply>...</reply><metadata>{packets_used, new_knowledge}</metadata>`. See §5.4. |
 | `INGEST_SYSTEM_ADDENDUM` | Appended to `SYSTEM_PROMPT_TEMPLATE` when `is_ingest_request=true`. Adds instructions: (1) acknowledge the source URL, (2) reply with 2-3 takeaways, (3) emit `new_knowledge` items whose `content` references `[IMG_n]` placeholders for content-bearing images and omits placeholders for decorative ones, (4) the image manifest is authoritative — do not invent new `[IMG_n]` tokens. See §5.7. |
 | `INGEST_USER_FRAMING` | Wraps the user message when ingesting. Format: `<user_message>... original user text ...</user_message><fetched_sources><source url="..."><markdown>...</markdown><images>[IMG_1] alt="..." 124KB png 800x600 | [IMG_2] alt="..." ...</images></source></fetched_sources>`. Multiple sources if multiple URLs. |
 | `INTEGRATE_PROMPT` | Integrate-on-write prompt. Slots: `existing_facets`, `existing_entities`, `existing_content`, `existing_source_urls`, `existing_authoritativeness`, `new_content`, `new_source_url`, `new_authoritativeness`, `writer_role`. `new_source_url` is `null` for conversation-driven integrations, set when integrating ingested content. The two `*_authoritativeness` numbers drive the trust-based conflict rule: the LLM is instructed that for **conflicting facts**, the source with higher authoritativeness wins (new replaces existing if `new ≥ existing`; existing wins if `new < existing`, with the new claim recorded as a less-trusted alternate); for **non-conflicting facts**, normal merge applies. The LLM still emits `conflict_detected` when the trusts are equal — that's the only branch that escalates to the user. The LLM is told to keep `coco-img:<id>` references intact when they appear in `existing_content` or `new_content`. |
 | `NEW_PACKET_PROMPT` | Scratchpad-promotion / fresh-packet prompt. Slots: `seed_topic`, `seed_content`, `seed_source_url`, `seed_authoritativeness`, `writer_role`. `seed_source_url` is null for conversation-driven creation, set for ingest. The LLM is told the trust score so it can phrase the gist/summary with appropriate hedging when the seed comes from a low-trust source. |
 | `format_packets_for_prompt(loaded_packets)` | Renders facets + entities + `source_urls` + slice content per packet. For each loaded packet that has images (and whose slice is `full`), also renders an `images:` block listing `[img_<id>] alt="..." NNkB mime WxH` lines so the LLM can correlate the multimodal image blocks (attached to the user message) with their alt text. |
-| `build_system_prompt(loaded_packets, user_name, ingest_mode=False)` | Assembles main system prompt; appends `INGEST_SYSTEM_ADDENDUM` if `ingest_mode` |
+| `build_system_prompt(loaded_packets, user_name, ingest_mode=False)` | Assembles main system prompt; appends `INGEST_SYSTEM_ADDENDUM` if `ingest_mode`. Callers (`agent._chat_turn_inner`, `agent._handle_ingest`) pass `user_name=session.user.prompt_display_name()` — the SSO-acquired display name — so Coco has the user's identity in her prompt context each turn. `Identity.prompt_display_name()` returns `Identity.name` for authenticated sessions and normalizes anonymous mode (where `Identity.name == "anonymous"`) to `"the user"`. |
 | `build_user_content_blocks(history, current_message, loaded_packets, fetch_results=None, ingest_failures=None)` | Returns a `list[dict]` of Anthropic content blocks: text blocks for history + current message + fetched markdown, followed by `image` blocks for (a) every `PacketImage` belonging to a loaded packet at the `full` slice, and (b) every candidate image in the ingest manifest. Image block shape: `{"type": "image", "source": {"type": "base64", "media_type": mime, "data": data_b64}}`. SVGs are rendered as text (the model doesn't accept image/svg+xml). |
 | `build_ingest_user_message(history, current_message, fetch_results, failed_urls=None)` | Convenience: calls `build_user_content_blocks` with `fetch_results` and an empty `loaded_packets`. Returns the same `list[dict]` shape. |
 | `extract_json_block(text)` | Strips ` ```json` fences if present |
@@ -305,9 +308,10 @@ class Session:
 **Public API:**
 | Symbol | Signature | Notes |
 |---|---|---|
-| `chat_turn(user_message, session, store, scratchpad, config, session_n, ingest_intent=None)` | async → `str` | Public turn entry; wraps tracing session + root span. `ingest_intent` is the `{is_ingest_request, urls}` slice of the last submit extraction (passed through by `run_session`); when `is_ingest_request=true`, `_chat_turn_inner` dispatches via `_handle_ingest`. |
-| `_chat_turn_inner(...)` | async → `str` | The actual work; runs inside the tracing root span. Branches on `ingest_intent.is_ingest_request`. |
+| `chat_turn(user_message, session, store, scratchpad, config, session_n, ingest_intent=None, upload_intent=None)` | async → `str` | Public turn entry; wraps tracing session + root span. `ingest_intent` is the `{is_ingest_request, urls}` slice of the last submit extraction; `upload_intent` is the `{is_upload_request, file_paths}` slice (same submit extraction). When `is_ingest_request=true`, `_chat_turn_inner` dispatches via `_handle_ingest`; when `is_upload_request=true`, via `_handle_document_upload`. The two intents are mutually exclusive — the small LM picks at most one per submit. |
+| `_chat_turn_inner(...)` | async → `str` | The actual work; runs inside the tracing root span. Branches on `ingest_intent.is_ingest_request` and `upload_intent.is_upload_request`. |
 | `_handle_ingest(user_message, urls, session, store, scratchpad, config)` | async → `str` | Ingest dispatch: calls `fetch.fetch_url` for each URL (concurrent), assembles ingest-mode prompt + multimodal user content blocks (candidate images attached), runs `main_reply` (streamed to stdout), parses the response, materializes `PacketImage` records from kept `[IMG_n]` tokens and rewrites references in each `new_knowledge[i].content`, then drives the standard write-path via `integrate_into_packet` / `_create_packet_from_seed`. Returns the reply text. See §5.7. |
+| `_handle_document_upload(user_message, file_paths, session, store, scratchpad, config)` | async → `str` | Document-upload dispatch. For each file: opens `document.read_document(path, config)` (streaming generator), pulls metadata, then streams chunks into the main reply LLM in batches of `ingest_doc_batch_chunks`. Each batch produces `new_knowledge` items tagged with `(page_number, paragraph_index)`; each item routes through `integrate_into_packet` / `_create_packet_from_seed` with `PacketSource.from_document(...)` provenance. Streams progress hints to stdout every `ingest_doc_progress_interval_pages` pages. Returns a final summary reply. See §5.11. |
 | `_materialize_packet_images(content, fetch_images, source_url)` | sync → `(rewritten_content: str, packet_images: list[PacketImage])` | For each `[IMG_n]` token that appears in `content` AND is present in `fetch_images`: mint a new `img_<hex>` id, build a `PacketImage` (copying alt, mime, dimensions, base64 from `ImageBlob.data_uri`), rewrite the `[IMG_n]` token in `content` to `![alt](coco-img:img_<new_id>)`. Stray `[IMG_n]` tokens (not in `fetch_images`) are stripped with a warning. Returns the rewritten markdown plus the list of newly-minted `PacketImage`s ready to append to a packet. |
 | `_attach_packet_images(packet, images)` | sync → `None` | Append each `PacketImage` in `images` to `packet.images`. Idempotent on image id. |
 | `_retrieve_packets(query_text, query_vec, session, store, config, span_name)` | sync → `list[{id, slice, topic, score}]` | 3-channel RRF, strength gating, slice selection, event recording. Returns newly-loaded packets (with the post-strength-bias final score) so the caller can print debug output including the score that cleared `retrieval_threshold`. **Callers (only `on_text_event`) pass the small-LM's `topic_summary` as `query_text` and `topic_vec` as `query_vec` — never the raw user message** (see §5.3 for rationale). |
@@ -362,7 +366,7 @@ The word-count trigger guarantees Coco doesn't fall behind during long uninterru
 **Public API:**
 | Symbol | Signature | Notes |
 |---|---|---|
-| `EXTRACTION_PROMPT` | str | Receives partial text + the session's existing topic-summaries and entity bag; asks for JSON: `{is_meaningful, has_new_topic, has_new_entities, topic_summary, entities, is_ingest_request, urls, reason}` |
+| `EXTRACTION_PROMPT` | str | Receives partial text + the session's existing topic-summaries and entity bag; asks for JSON: `{is_meaningful, has_new_topic, has_new_entities, topic_summary, entities, is_ingest_request, urls, is_upload_request, file_paths, reason}` |
 | `extract_partial(partial_text, existing_topics, existing_entities, config)` | async → `ExtractionResult` | Calls small LM with novelty context; if the result will trigger retrieval, embeds `topic_summary` inline |
 | `parse_extraction_response(raw)` | → `dict` | Same JSON-fence-aware parser shape as the existing ones |
 
@@ -377,15 +381,24 @@ The word-count trigger guarantees Coco doesn't fall behind during long uninterru
   topic_summary:     str | None,
   entities:          list[str],
   topic_vec:         np.ndarray | None,
-  is_ingest_request: bool,            # True iff the user uttered a fetch intent
+  is_ingest_request: bool,            # True iff the user uttered a URL-fetch intent
                                       #   ("read this", "remember this site",
                                       #    "add this to your knowledge", etc.)
                                       #   AND `urls` is non-empty
   urls:              list[str],       # http/https URLs extracted from the text
                                       #   (regex-extracted, deduped, validated)
+  is_upload_request: bool,            # True iff the user uttered a file-upload intent
+                                      #   ("upload this", "read this file",
+                                      #    "add this document", etc.) AND `file_paths`
+                                      #   is non-empty. Mutually exclusive with
+                                      #   is_ingest_request — the small LM picks one.
+  file_paths:        list[str],       # filesystem paths extracted from the text
+                                      #   (regex + heuristic match on supported
+                                      #    extensions; validated for existence
+                                      #    before the agent dispatches)
   reason:            str | None,      # e.g. "niceties", "too_short", "too_generic",
                                       #      "topic_continues", "entities_overlap",
-                                      #      "ingest_request"
+                                      #      "ingest_request", "upload_request"
 }
 ```
 
@@ -470,6 +483,67 @@ class FetchError(Exception):
 
 **Depends on:** `httpx`, `readability-lxml`, `markdownify`, `Pillow`, `lxml`, `coco.tracing`.
 
+### 2.12a `coco.document` *(new for document upload)*
+
+**Purpose.** Streaming reader for uploaded files (PDF, DOCX, PPTX, plain text, markdown). Yields chunks (paragraphs for word-processing, slides for presentations) so the agent can route each chunk through the write-path without loading the whole file into memory. Detects document type for ambiguous formats (PDF) via a small-LM classifier.
+
+**Public API:**
+| Symbol | Signature | Notes |
+|---|---|---|
+| `DocumentChunk` | dataclass | `{text: str, page_number: int, paragraph_index: int \| None, source_filename: str, document_type: str}`. `paragraph_index` is `None` for presentation-style (each chunk is one slide; the slide *is* the unit). |
+| `DocumentMetadata` | dataclass | `{filename: str, format: "pdf"\|"docx"\|"pptx"\|"text"\|"markdown", document_type: "word_processing"\|"presentation", page_count: int \| None, file_authoritativeness: float}` — built once at the top of the stream. |
+| `read_document(path, config)` | async generator → yields `DocumentMetadata` once, then `DocumentChunk` per chunk | The single streaming entry point used by `agent._handle_document_upload`. Handles format dispatch, classifier call, chunking. Errors surface as `DocumentError`. |
+| `detect_document_type(sample_pages: list[str], config)` | async → `"word_processing"` \| `"presentation"` | Small-LM classifier; only fired for PDF. DOCX → `"word_processing"`; PPTX → `"presentation"`; text/markdown → `"word_processing"`. |
+| `_iter_pdf_pages(path, config)` | sync generator → yields `(page_number, text)` | `pypdf.PdfReader` page-by-page; never loads more than one page's bytes at a time. Pages with no extractable text are yielded with `text=""` so page numbering stays accurate; they don't drive chunks. |
+| `_iter_docx_paragraphs(path, config)` | sync generator → yields `(paragraph_index, text)` | `python-docx` iterates paragraphs in order. |
+| `_iter_pptx_slides(path, config)` | sync generator → yields `(slide_number, text)` | `python-pptx`; one chunk per slide. Speaker notes appended after slide text. |
+| `_chunk_word_processing(page_iter, config)` | sync generator → yields `DocumentChunk` | Paragraph splitter: double-newline boundaries; merge paragraphs `< ingest_doc_min_paragraph_chars`; split paragraphs `> ingest_doc_max_paragraph_chars` at sentence boundaries; preserves `page_number` + `paragraph_index`. |
+| `_chunk_presentation(page_iter, config)` | sync generator → yields `DocumentChunk` | One chunk per page/slide. No merging or splitting — slides are the unit. |
+| `resolve_file_authoritativeness(filename, config)` | sync → `float` | Longest-match against `config.file_authoritativeness` keys (glob and/or path-prefix). Falls back to `config.default_file_authoritativeness` (default `0.5`). See §5.10. |
+
+**Types:**
+```python
+@dataclass
+class DocumentChunk:
+    text: str
+    page_number: int
+    paragraph_index: int | None       # None for presentation slides
+    source_filename: str
+    document_type: str                # "word_processing" | "presentation"
+
+@dataclass
+class DocumentMetadata:
+    filename: str
+    format: str                       # "pdf" | "docx" | "pptx" | "text" | "markdown"
+    document_type: str
+    page_count: int | None
+    file_authoritativeness: float
+
+class DocumentError(Exception):
+    """Fatal upload errors — unsupported format, unreadable file, oversize, etc."""
+```
+
+**`read_document` flow:**
+1. Resolve format from file extension; sniff MIME as a backstop for `.pdf` look-alikes. Reject unsupported formats via `DocumentError`.
+2. Resolve `file_authoritativeness` and `document_type` (classifier for PDF; format-implied for the rest).
+3. Yield `DocumentMetadata` first so the caller can stamp the trust on every subsequent chunk without recomputing.
+4. Open the format-specific page iterator. Drive the appropriate chunker. Yield chunks until exhausted.
+5. Tolerate per-page errors: a corrupt page surfaces as an empty `(page_number, "")` so page numbering stays stable; the rest of the file continues processing.
+
+**Document-type classification.** PDFs only. The small LM (`config.small_lm_model`, default `claude-haiku-4-5`) receives the first `ingest_doc_classifier_sample_pages` (default `3`) pages of extracted text concatenated, and is asked to emit JSON `{document_type: "word_processing" | "presentation", reason: str}`. Heuristics the prompt mentions: presentations have many short pages with bulleted layout and large headings; word-processing has long flowing paragraphs. Classification result is cached on `DocumentMetadata.document_type` and reused for every subsequent chunk.
+
+**Chunking parameters** (config knobs, see §4):
+- `ingest_doc_min_paragraph_chars` — paragraphs shorter than this merge with the next paragraph on the same page (default `120`).
+- `ingest_doc_max_paragraph_chars` — paragraphs longer than this split at the nearest sentence boundary (default `1500`).
+- `ingest_doc_max_pages` — hard cap on the number of pages processed per upload (default `500`). Beyond this, `read_document` stops yielding and the caller surfaces a "truncated" notice.
+- `ingest_doc_batch_chunks` — the agent's batch size for grouping chunks per write-path LLM call (default `10`). See §5.11.
+
+**Tracing.** `read_document` opens a `document_upload_read` span carrying `filename`, `format`, `document_type`, `file_authoritativeness`, `page_count`. Sub-spans:
+- `detect_document_type` (generation, small LM) — input: sample pages; output: type + reason. Only for PDF.
+- `read_pdf_pages` / `read_docx_paragraphs` / `read_pptx_slides` (span, parent of chunk emission) — input: filename; output: chunks_emitted, pages_processed, errors.
+
+**Depends on:** `pypdf>=4.0`, `python-docx>=1.1`, `python-pptx>=0.6`, `coco.llm`, `coco.tracing`, `coco.auth` (for `resolve_file_authoritativeness`).
+
 ### 2.13 `coco.__main__`
 
 ```python
@@ -546,19 +620,31 @@ PacketImage:
 
 ```
 PacketSource:
-  type:                "url" | "conversation"
+  type:                "url" | "conversation" | "document"
+  # URL-only
   url:                 str | None                         # type=url: absolute URL after redirects
   domain_authoritativeness: float | None                  # type=url: resolved from
-                                                          #   config.domain_authoritativeness;
-                                                          #   None for conversation
-  speaker_name:        str | None                         # type=conversation: Identity.name
-                                                          # type=url: Identity.name of the ingester
-                                                          #   (records WHO triggered the read)
-  speaker_email:       str | None                         # same as above
-  speaker_role:        str | None                         # the writer's role at write time
+                                                          #   config.domain_authoritativeness
+  # Document-only
+  filename:            str | None                         # type=document: original filename
+  document_type:       str | None                         # type=document: "word_processing"
+                                                          #   | "presentation"
+  page_number:         int | None                         # type=document: 1-based page index
+  paragraph_index:     int | None                         # type=document, WP: 0-based paragraph
+                                                          #   within the page; None for slides
+  file_authoritativeness: float | None                    # type=document: resolved from
+                                                          #   config.file_authoritativeness
+  # Speaker (always present)
+  speaker_name:        str | None                         # writer's Identity.name
+  speaker_email:       str | None                         # writer's Identity.email
+  speaker_role:        str | None                         # writer's role at write time
   role_authoritativeness:      float                      # writer's role authoritativeness at write time
+  # Computed
   effective_authoritativeness: float                      # max(role_authoritativeness,
-                                                          #     domain_authoritativeness or 0.0)
+                                                          #     source_trust or 0.0)
+                                                          # where source_trust is whichever of
+                                                          # domain_authoritativeness /
+                                                          # file_authoritativeness applies
   recorded_at:         ISO-8601
 ```
 
@@ -566,7 +652,8 @@ PacketSource:
 | Factory | Use |
 |---|---|
 | `PacketSource.from_url(url, domain_auth, writer: Identity)` | URL ingestion. `domain_auth` is the value returned by `auth.resolve_domain_authoritativeness(url, config)`. The writer is the current session user (the person who asked Coco to ingest). |
-| `PacketSource.from_conversation(writer: Identity)` | Conversation-driven write. No URL or domain term; `effective_authoritativeness = writer.role_authoritativeness`. |
+| `PacketSource.from_conversation(writer: Identity)` | Conversation-driven write. No URL/file/domain term; `effective_authoritativeness = writer.role_authoritativeness`. |
+| `PacketSource.from_document(filename, document_type, page_number, paragraph_index, file_auth, writer: Identity)` | Document upload. `file_auth` comes from `auth.resolve_file_authoritativeness(filename, config)`. `effective_authoritativeness = max(role_auth, file_auth)`. `paragraph_index` is `None` for presentation chunks. |
 
 **Why store both the speaker *and* the URL for ingest sources.** The page is the *epistemic* source — that's what backs the fact and drives `effective_authoritativeness`. The ingester is the *causal* source — that's who decided this knowledge belongs in the system. Both matter: a `viewer` triggering an ingest of Wikipedia still produces a trust-1.0 packet (the page is trusted), but if that viewer later disputes the fact in conversation, the dispute itself carries only viewer-level trust. Keeping both fields makes the audit trail self-contained.
 
@@ -632,13 +719,32 @@ Identity:
 
 | role | capabilities |
 |---|---|
-| `admin` | `read_packets`, `write_scratchpad`, `promote_scratchpad`, `create_packet`, `integrate_packet`, `override_conflict`, `delete_packet`, `force_rewrite`, `skill.fetch_url` |
-| `author` | `read_packets`, `write_scratchpad`, `promote_scratchpad`, `create_packet`, `integrate_packet`, `skill.fetch_url` |
+| `admin` | `read_packets`, `write_scratchpad`, `promote_scratchpad`, `create_packet`, `integrate_packet`, `override_conflict`, `delete_packet`, `force_rewrite`, `skill.fetch_url`, `skill.upload_document` |
+| `author` | `read_packets`, `write_scratchpad`, `promote_scratchpad`, `create_packet`, `integrate_packet`, `skill.fetch_url`, `skill.upload_document` |
 | `viewer` | `read_packets` |
-| `user` | `read_packets`, `write_scratchpad`, `skill.fetch_url` |
+| `user` | `read_packets`, `write_scratchpad`, `skill.fetch_url`, `skill.upload_document` |
 | `anonymous` | `read_packets` |
 
 v2 stores both `role_authoritativeness` and `capabilities` on `Identity`. `capabilities` are enforced at the call sites listed in §5.9. `role_authoritativeness` is consumed by the write path and by retrieval: it feeds `effective_authoritativeness` on every `PacketSource` (§5.10), drives the trust-based conflict resolution in `integrate_into_packet` (§7.7 / §7.12), and contributes to the retrieval-ranking bias via `packet.authoritativeness` (§5.2). It is also surfaced into Langfuse trace metadata so post-hoc analysis can filter by role and trust level.
+
+**Identity → agent context (name is in the reply prompt every turn).** Once `acquire_identity` returns, `Session.user.name` (the SSO display name — Entra `name` claim or Google `name` claim) is threaded into every main-reply LLM call. `agent._chat_turn_inner` and `agent._handle_ingest` both call:
+
+```python
+system_prompt = build_system_prompt(
+    session.loaded_packets_list(),
+    user_name=session.user.prompt_display_name(),  # Identity.name, or "the user" for anonymous
+    ingest_mode=...,
+)
+```
+
+which renders as `You are Coco, a self-learning conversational assistant for <name>.` at the top of `SYSTEM_PROMPT_TEMPLATE`. `Identity.prompt_display_name()` lives on the `Identity` dataclass (§3.4) and encapsulates the anonymous-mode normalization. Concretely:
+
+- **Authenticated sessions** — `prompt_display_name()` returns `Identity.name` verbatim (e.g. `"Shishir Choudhary"`). Coco can address the user by name from the first message, and self-referential packets (facets like `"Shishir's family members"`, entities like `"shishir"`) match naturally against context that now already contains the user's name.
+- **Anonymous sessions** — `Identity.name == "anonymous"` and `provider == "anonymous"`; `prompt_display_name()` returns the literal string `"the user"` so the rendered prompt reads sensibly ("…assistant for the user.") rather than surfacing the placeholder role label.
+- **Startup banner uses the same source.** `ui.banner_welcome(identity.name)` (in `run_session`) shares the underlying `Identity.name`, so the greeting the user reads and the name Coco sees in her prompt cannot drift.
+- **Profile fields beyond name.** `email`, `role`, and `provider` remain on `Session.user` and flow to Langfuse trace metadata (`tracing.session_context(session.id, user_id=identity.email or identity.name, metadata=identity.trace_metadata())`) but are **not** spliced into the reply system prompt by default. A future extension may add an `identity_context_block(Identity) -> str` helper (invoked by `build_system_prompt`) to render `role`, `role_authoritativeness`, or team/tenant claims — but the v2 default keeps the reply prompt lean and passes just the display name.
+
+**Why not read `user_name` from `config`.** Earlier revisions (pre-auth) passed `config["user_name"]` (a static string in `config.json`) into `build_system_prompt`. That worked for a single-user personal install but is wrong once multiple users share a deployment — every session would see the same hard-coded name regardless of who logged in. With identity acquisition in place, `Session.user.name` is the single source of truth; the `user_name` key is removed from `DEFAULT_CONFIG` and `config.json` entirely (anonymous mode is handled by `prompt_display_name()`, not by a config fallback).
 
 ## 4. Configuration
 
@@ -652,12 +758,13 @@ All knobs read from `config.json` (defaults in `coco.config.DEFAULT_CONFIG`). Ca
 | Lifecycle | `recency_window`, `scratchpad_discard_after_sessions` |
 | Streaming | `streaming_debounce_ms` (default `350`), `streaming_words_per_partial` (default `5`), `streaming_min_chars` (default `12`), `streaming_max_partials_per_turn` (default `8`) |
 | URL ingestion | `ingest_enabled` (default `true`), `ingest_user_agent` (default `"coco/0.2 (+https://github.com/...)"`), `ingest_request_timeout_s` (default `15`), `ingest_max_page_bytes` (default `5_000_000`), `ingest_min_article_chars` (default `200` — below this, readability output is rejected as "no readable content"), `ingest_markdown_max_chars` (default `120_000`), `ingest_image_max_dim` (default `1280` — longest edge after downscale), `ingest_image_max_bytes` (default `500_000` — post-downscale; drop above), `ingest_image_concurrency` (default `4`), `ingest_max_images_per_page` (default `20` — manifest cap), `ingest_allowed_image_mimes` (default `["image/png","image/jpeg","image/gif","image/webp","image/svg+xml"]`) |
+| Document upload | `ingest_doc_enabled` (default `true`), `ingest_doc_allowed_formats` (default `["pdf","docx","pptx","txt","md"]`), `ingest_doc_max_file_bytes` (default `25_000_000`), `ingest_doc_max_pages` (default `500` — hard cap; beyond this `read_document` truncates with a notice), `ingest_doc_classifier_sample_pages` (default `3` — number of PDF pages fed to the document-type classifier), `ingest_doc_min_paragraph_chars` (default `120`), `ingest_doc_max_paragraph_chars` (default `1500`), `ingest_doc_batch_chunks` (default `10` — chunks per write-path LLM call), `ingest_doc_progress_interval_pages` (default `5` — emit a streamed progress hint every N pages) |
 | Image loading | `image_blocks_max_per_turn` (default `20` — total `image` content blocks attached to any single user message; over this, lowest-strength packets shed images first) |
 | Developer mode | `debug_print_state` (default `false`), `debug_print_streaming` (default `false`), `debug_print_write_path` (default `false`) — see §5.6. End-user UX (§5.5) is the default. |
 | Models | `embedding_model`, `anthropic_model`, `small_lm_model` (default `claude-haiku-4-5`) |
-| Storage | `data_dir`, `user_name` |
+| Storage | `data_dir` |
 | Authentication | `auth.startup_mode` (`"prompt"` \| `"anonymous"` \| `"authenticated"`; default `"prompt"`), `auth.providers` (ordered subset of `["anonymous","entra","google"]`), `auth.default_provider` (used when `startup_mode=="authenticated"`), `auth.default_role` (default `"user"`), `auth.fallback_to_anonymous` (default `true`), `auth.entra.tenant_id` / `client_id` / `scopes` / `flow` (`"device_code"` \| `"browser_pkce"`), `auth.google.client_id` / `scopes` / `redirect_uri`, `auth.email_role_map` (`{email -> role}`, case-insensitive), `auth.entra_group_role_map` (`{group_object_id -> role}`), `auth.role_capabilities` (`{role -> list[capability]}`; omitted roles inherit `DEFAULT_ROLE_CAPABILITIES`) |
-| Source trust | `domain_authoritativeness` (`{domain or domain/path-prefix -> float in [0,1]}`; longest-prefix match), `default_domain_authoritativeness` (default `0.5`; used when no pattern matches), `authoritativeness_bias_scale` (default `0.001`; scale of `h(authoritativeness)` added to RRF final score) |
+| Source trust | `domain_authoritativeness` (`{domain or domain/path-prefix -> float in [0,1]}`; longest-prefix match), `default_domain_authoritativeness` (default `0.5`; used when no pattern matches), `file_authoritativeness` (`{filename-glob or path-prefix -> float in [0,1]}`; longest-match wins; path-prefix beats glob on tie), `default_file_authoritativeness` (default `0.5`), `authoritativeness_bias_scale` (default `0.001`; scale of `h(authoritativeness)` added to RRF final score) |
 
 **Example `auth` block** (matches §2.1a `acquire_identity` exactly):
 
@@ -691,11 +798,14 @@ All knobs read from `config.json` (defaults in `coco.config.DEFAULT_CONFIG`). Ca
     "role_capabilities": {
       "admin":     ["read_packets", "write_scratchpad", "promote_scratchpad",
                     "create_packet", "integrate_packet", "override_conflict",
-                    "delete_packet", "force_rewrite", "skill.fetch_url"],
+                    "delete_packet", "force_rewrite",
+                    "skill.fetch_url", "skill.upload_document"],
       "author":    ["read_packets", "write_scratchpad", "promote_scratchpad",
-                    "create_packet", "integrate_packet", "skill.fetch_url"],
+                    "create_packet", "integrate_packet",
+                    "skill.fetch_url", "skill.upload_document"],
       "viewer":    ["read_packets"],
-      "user":      ["read_packets", "write_scratchpad", "skill.fetch_url"],
+      "user":      ["read_packets", "write_scratchpad",
+                    "skill.fetch_url", "skill.upload_document"],
       "anonymous": ["read_packets"]
     }
   },
@@ -708,6 +818,12 @@ All knobs read from `config.json` (defaults in `coco.config.DEFAULT_CONFIG`). Ca
     "reddit.com":                 0.2
   },
   "default_domain_authoritativeness": 0.5,
+  "file_authoritativeness": {
+    "/policies/":             0.9,
+    "acme-handbook-*.pdf":    0.9,
+    "*.draft.pdf":            0.3
+  },
+  "default_file_authoritativeness": 0.5,
   "authoritativeness_bias_scale":     0.001
 }
 ```
@@ -1125,6 +1241,7 @@ if not session.user.can(capability):
 | `integrate_packet` | `integrate_into_packet` (top of function, before the prompt build) | Return `False`; existing packet unchanged. The `new_knowledge` item is dropped. Hint shown once per turn. |
 | `override_conflict` | Inside `integrate_into_packet` when `conflict_detected=true` | Skip the interactive y/N prompt; treat as user-rejected → mutation skipped silently. Trace records `auto_skipped_conflict`. |
 | `skill.fetch_url` | `_handle_ingest` (immediately after entry, before `fetch_url` dispatch) | No network call. Coco replies with the denial hint inline ("I'm not able to read web pages for your account."); no `new_knowledge`, no `ingest` score, normal turn closure. |
+| `skill.upload_document` | `_handle_document_upload` (top of function, before file open) | No file is opened. Coco surfaces the denial hint ("I'm not able to read files for your account."); no `new_knowledge`, no `upload` score, normal turn closure. |
 | `delete_packet` / `force_rewrite` | Future admin operations | Same pattern; not yet wired. |
 | `skill.<id>` (future skills) | The skill-invocation site for each new skill (registered with the agent) | Per-skill clean exit defined when the skill is added. |
 
@@ -1193,7 +1310,136 @@ authoritativeness_bias(a, scale) = scale * a    # linear, [0, scale]
 | `_create_packet_from_seed` (ingest-driven) | `session.user` (the user who triggered the ingest); `source_url` is the page; `domain_auth = resolve_domain_authoritativeness(source_url, config)` |
 | `integrate_into_packet` (conversation-driven) | `session.user`; no `source_url` |
 | `integrate_into_packet` (ingest-driven) | `session.user`; `source_url` is the per-`new_knowledge` URL |
-| Future skills writing back to memory | the skill's invocation site passes `session.user`; if a skill federates content from yet another source, that source's domain auth is resolved the same way |
+| `_create_packet_from_seed` / `integrate_into_packet` (document-upload-driven) | `session.user` (the uploader); the per-chunk `PacketSource.from_document(...)` carries `(filename, document_type, page_number, paragraph_index, file_auth)`. `file_auth = resolve_file_authoritativeness(filename, config)`. |
+| Future skills writing back to memory | the skill's invocation site passes `session.user`; if a skill federates content from yet another source, that source's domain/file auth is resolved the same way |
+
+### 5.11 Document ingestion pipeline
+
+End-to-end flow when `extraction.is_upload_request=true` on the `submit` event. The file is read in streaming fashion — packets are written as soon as the next batch of chunks is ready, not after the whole file is parsed.
+
+```
+chat_turn(user_message, ..., upload_intent={is_upload_request: true, file_paths: [p1, p2]})
+  │
+  └─▶ _chat_turn_inner
+        │
+        └─▶ _handle_document_upload(user_message, file_paths, session, store, scratchpad, config)
+              │
+              ├─[A] capability + file validation
+              │     if not session.user.can("skill.upload_document"):
+              │         _capability_denied(session.user, "skill.upload_document"); return
+              │     for p in file_paths:
+              │         validate exists + size <= ingest_doc_max_file_bytes
+              │         + extension in ingest_doc_allowed_formats
+              │     valid_files = [...]
+              │     if not valid_files:
+              │         stream a brief failure reply; return
+              │
+              ├─[B] open document.read_document(path, config) — async generator
+              │     metadata: DocumentMetadata = next(stream)
+              │     # metadata.document_type already resolved (classifier ran for PDF)
+              │     # metadata.file_authoritativeness already resolved
+              │     stream a one-line ack:
+              │       "Reading <filename> ({format}, {document_type}, ~{page_count} pages,
+              │        trust {file_auth:.2f})..."
+              │
+              ├─[C] streaming chunk loop — accumulate ingest_doc_batch_chunks chunks
+              │     batch: list[DocumentChunk] = []
+              │     async for chunk in stream:
+              │         batch.append(chunk)
+              │         if len(batch) >= ingest_doc_batch_chunks:
+              │             await _process_document_batch(
+              │                 batch, metadata, session, store, scratchpad, config,
+              │             )
+              │             batch = []
+              │     if batch:
+              │         await _process_document_batch(...)  # flush
+              │
+              └─[D] final summary reply
+                    "Read N pages of <filename>. Created K packets, updated M,
+                     skipped P filler chunks."
+
+_process_document_batch(batch, metadata, session, store, scratchpad, config):
+  │
+  ├─[D.1] build prompt + content
+  │       system_prompt = prompts.build_document_batch_system_prompt(
+  │                          metadata, session.loaded_packets, user_name,
+  │                      )
+  │       user_blocks  = prompts.build_document_batch_user_blocks(batch, metadata)
+  │       # The system prompt explains paragraph-by-paragraph routing and the
+  │       # filler-skip protocol; the user blocks render each chunk with a stable
+  │       # [P{page}.{para}] tag the LLM uses in its new_knowledge[i].chunk_ref.
+  │
+  ├─[D.2] streamed LLM call (main_reply, Sonnet)
+  │       raw = await _claude_call(..., stream_to_stdout=True)
+  │       # The LLM streams a short progress paragraph (e.g.
+  │       #   "pages 4-6: saved 1 new packet about Alka's family, updated 2
+  │       #    existing packets, skipped 1 page of references")
+  │       # followed by <metadata>{packets_used, new_knowledge[]}</metadata>.
+  │
+  ├─[D.3] parse + route each new_knowledge item
+  │       parsed = parse_coco_response(raw)
+  │       for nk in parsed.new_knowledge:
+  │           # nk.chunk_ref is e.g. "P14.2" — map it back to the source chunk
+  │           src_chunk = batch[index_from_chunk_ref(nk.chunk_ref)]
+  │
+  │           # Build the PacketSource for THIS write up front
+  │           file_auth = metadata.file_authoritativeness
+  │           src = PacketSource.from_document(
+  │               filename=metadata.filename,
+  │               document_type=metadata.document_type,
+  │               page_number=src_chunk.page_number,
+  │               paragraph_index=src_chunk.paragraph_index,
+  │               file_auth=file_auth,
+  │               writer=session.user,
+  │           )
+  │
+  │           # Standard write-path (no scratchpad-only for upload, same as URL ingest)
+  │           best, score = retrieval.best_packet_facet_match(
+  │               embed(nk.implied_topic), store.all(),
+  │           )
+  │           if score >= existing_packet_match_threshold:
+  │               await integrate_into_packet(
+  │                   best, nk.content, store, config,
+  │                   writer=session.user, source=src,
+  │               )
+  │           else:
+  │               await _create_packet_from_seed(
+  │                   nk.implied_topic, nk.content, store, config,
+  │                   session.id, writer=session.user, source=src,
+  │               )
+```
+
+**`new_knowledge` shape in document-upload mode:**
+```json
+{
+  "chunk_ref": "P14.2",            // P<page>.<paragraph_index> for WP,
+                                   // P<page> for presentation slides
+  "content": "...markdown of the distilled fact(s) from this chunk...",
+  "implied_topic": "Alka's family background",
+  "conflicts_with": "pkt_... or null",
+  "conflict_description": "..."
+}
+```
+
+The LLM may also emit chunks with `"skip": true` (filler) — those don't produce a `new_knowledge` entry; they're just counted in the batch summary.
+
+**Key non-obvious choices:**
+
+1. **One streaming generator, many LLM calls.** The PDF/DOCX/PPTX reader is a single async generator that yields chunks as they're parsed. The agent batches into LLM-sized groups (~10 chunks per call). This keeps both ends honest: the reader doesn't have to know about LLM batch sizes; the agent doesn't have to know about format internals.
+
+2. **No scratchpad-only outcome for documents.** An uploaded document is a deliberate act (the user pointed at a file); each `new_knowledge` is stronger evidence than a passing chat mention. If a chunk has no facet match above threshold, a new packet is created directly. Same rule as URL ingest.
+
+3. **Streaming reply is the audit log.** The main LLM streams a per-batch progress sentence ("pages 4-6: saved 1 new packet …, updated 2, skipped 1 page of references"). The concatenation of those sentences across the upload IS the post-hoc summary; no extra summarization step is needed.
+
+4. **Per-chunk PacketSource — not per-document.** A `PacketSource.from_document(...)` is appended on every commit, so one upload may produce many sources across many packets. Audit-trail accuracy matters more than storage compactness.
+
+5. **Document-type classifier locked in early.** The classifier sees only the first `ingest_doc_classifier_sample_pages` pages. If a PDF is genuinely mixed (e.g. a slide deck embedded inside a longer report), the classifier picks one strategy and runs with it. Mid-document re-classification is future work — the trade-off is consistency over precision.
+
+6. **Trust resolution per chunk uses the same `effective_authoritativeness(role, file_auth)`** as URL ingest uses with `domain_auth`. The conflict policy in `integrate_into_packet` is unchanged: trust-driven LLM merge; user prompt only on equal-trust escalation with `override_conflict` capability.
+
+7. **Page-by-page errors are tolerated.** A corrupt page surfaces as `(page_number, "")` from the reader so the rest of the file continues. The empty page doesn't generate a chunk; the page count stays accurate; the trace records `pages_failed`.
+
+8. **Truncation at the page cap.** Documents over `ingest_doc_max_pages` stop yielding at the cap. The final summary mentions the truncation; an explicit re-run can extend the cap.
 
 ---
 
@@ -1222,7 +1468,7 @@ session ses_…
 | Outer trace | Inner spans | Notes |
 |---|---|---|
 | `partial_event` / `submit_event` (root span around `on_text_event`) | `streaming_extraction` (generation, small LM call), `streaming_retrieval` (span around `_retrieve_packets`) | `streaming_retrieval` is absent when the guard fires early (not meaningful / not novel). The trigger reason is recorded on the root span output for visibility. |
-| `chat_turn` (root span) | `main_reply` (generation, big LM, streamed), `integrate_on_write` (generation, per merge), `new_packet_creation` (generation, on scratchpad promotion). **On ingest turns:** additionally `url_ingest` (span) wrapping the fetch and image processing — `fetch_html` (sub-span, per URL), `extract_article` (sub-span, per URL), `process_images` (sub-span, per URL). | One per turn. `topic_resolution`, `pre_retrieval`, `refinement_retrieval` no longer exist — all retrieval happens in the streaming traces. |
+| `chat_turn` (root span) | `main_reply` (generation, big LM, streamed), `integrate_on_write` (generation, per merge), `new_packet_creation` (generation, on scratchpad promotion). **On URL-ingest turns:** additionally `url_ingest` (span) wrapping the fetch and image processing — `fetch_html` (sub-span, per URL), `extract_article` (sub-span, per URL), `process_images` (sub-span, per URL). **On document-upload turns:** additionally `document_upload` (span) wrapping each file's read — `document_upload_read` per file (with sub-spans `detect_document_type` (PDF only), `read_pdf_pages` / `read_docx_paragraphs` / `read_pptx_slides`), then one `main_reply` generation per batch of `ingest_doc_batch_chunks` chunks. | One per turn. `topic_resolution`, `pre_retrieval`, `refinement_retrieval` no longer exist — all retrieval happens in the streaming traces. |
 
 Generations carry `model`, `input`, `output`, and for `main_reply` the streaming output is finalized at end of stream.
 
@@ -1233,6 +1479,7 @@ Generations carry `model`, `input`, `output`, and for `main_reply` the streaming
 - `use` scores fire on `chat_turn` traces (Coco cited a packet in her reply).
 - `write` scores fire on `chat_turn` traces (integrate-on-write / new packet creation).
 - `ingest` scores fire on `chat_turn` traces (one per URL successfully fetched and committed); comment carries the source URL and the target packet id.
+- `upload` scores fire on `chat_turn` traces (one per document chunk successfully committed); comment carries `<filename>:P<page>.<para> → <pkt_id> trust=<eff>`.
 
 This separation makes the UI show *where* memory activity happened across the lifecycle of a single user turn.
 
@@ -1981,6 +2228,101 @@ packet.authoritativeness (existing) = 1.0  (was ingested from a 1.0-domain by an
 → packet.authoritativeness stays at 1.0 (monotone-up)
 ```
 
+### 7.13 Document ingestion path (upload-mode `chat_turn`)
+
+Shows the divergence when `upload_intent.is_upload_request=true`. Pre-streaming (extraction + retrieval) is identical to non-upload turns and omitted; this diagram picks up at `chat_turn`. Per-chunk write-path (`integrate_into_packet` / `_create_packet_from_seed`) is identical to §7.7 / §7.8 — also omitted for clarity.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant RS as run_session
+    participant CT as chat_turn
+    participant CTI as _chat_turn_inner
+    participant HU as _handle_document_upload
+    participant CAP as capability check
+    participant D as document.read_document
+    participant SLM as small LM (classifier)
+    participant CC as _claude_call
+    participant WP as write-path<br/>(§7.7 / §7.8)
+    participant ST as PacketStore
+    participant TR as tracing
+
+    Note over RS: submit extraction returned<br/>is_upload_request=true,<br/>file_paths=[/abs/path/handbook.pdf]
+    RS->>CT: chat_turn(text, ..., upload_intent={is_upload_request: true, file_paths})
+    CT->>CTI: _chat_turn_inner with upload_intent
+    CTI->>HU: _handle_document_upload(text, file_paths, ...)
+    HU->>CAP: session.user.can("skill.upload_document")?
+    alt denied
+        CAP-->>HU: false
+        HU->>TR: score("capability_denied", 1)
+        HU->>U: dim hint "I'm not able to read files..."
+        HU-->>CT: return brief reply, no memory mutation
+    end
+
+    HU->>TR: observation("document_upload", input=file_paths)
+    activate TR
+
+    HU->>HU: validate each file (exists, size, extension)
+    alt no valid files
+        HU->>U: stream brief failure reply
+        HU-->>CT: return
+    end
+
+    loop each valid file
+        HU->>D: read_document(path, config)
+        activate D
+        D-->>HU: yield DocumentMetadata
+        Note over D: PDF only: detect_document_type<br/>fires on first ~3 pages
+        opt PDF (format==pdf)
+            D->>SLM: classify first sample pages
+            SLM-->>D: "word_processing" | "presentation"
+        end
+
+        HU->>U: stream ack<br/>"Reading {filename} ({fmt}, {doc_type},<br/>~{pages} pages, trust {fa:.2f})..."
+
+        loop streaming chunks
+            D-->>HU: yield DocumentChunk
+            HU->>HU: append to batch
+            alt len(batch) >= ingest_doc_batch_chunks
+                HU->>CC: main_reply (streamed)<br/>system+prompt include batch<br/>+ loaded_packets context
+                Note over CC: LLM streams a per-batch<br/>progress sentence,<br/>then <metadata>{new_knowledge[]}</metadata>
+                CC-->>HU: raw response
+                HU->>HU: parse_coco_response(raw)
+
+                loop each nk in new_knowledge
+                    HU->>HU: build PacketSource.from_document(<br/>filename, doc_type, page, para,<br/>file_auth, writer=session.user)
+                    HU->>WP: integrate_into_packet OR<br/>_create_packet_from_seed<br/>(source=PacketSource)
+                    WP->>ST: save packet; add_source<br/>(authoritativeness rises if applicable)
+                    WP->>TR: score("write", ...);<br/>score("upload", ...)
+                end
+                HU->>HU: clear batch
+            end
+        end
+        deactivate D
+
+        opt batch not empty
+            HU->>CC: main_reply (flush remaining)
+            CC-->>HU: raw
+            Note over HU,WP: same parse + route loop
+        end
+    end
+
+    HU->>U: stream final summary<br/>"Read N pages of {filename}.<br/>Created K packets, updated M,<br/>skipped P filler chunks."
+    HU->>TR: update span output={files, packets_created, packets_updated, chunks_skipped, pages_processed}
+    deactivate TR
+
+    HU-->>CTI: reply (the streamed narrative)
+    CTI-->>CT: reply
+    CT-->>U: full reply (already streamed)
+```
+
+**Notes on the diagram:**
+- `document.read_document` is itself an async generator. Sub-spans `read_pdf_pages` (or `read_docx_paragraphs` / `read_pptx_slides`) live inside the `document_upload` parent.
+- The per-chunk write-path branches into `integrate_into_packet` (§7.7, trust-driven merge) or `_create_packet_from_seed` (§7.8). The only difference vs the URL-ingest variant is the `PacketSource.from_document(...)` provenance — the trust math and conflict policy are identical.
+- "Filler" chunks (`skip: true` from the LLM) never reach the write path. They're recorded in the trace as `chunks_skipped`.
+- Upload turns never go through the scratchpad-only outcome — same rationale as URL ingest (an explicit upload is stronger evidence than a passing chat mention).
+- If a corrupt page surfaces an exception in the reader, the generator yields `(page_number, "")` instead; the loop continues. The empty page produces no chunks; the trace records `pages_failed`.
+
 ---
 
 ## 8. Error handling
@@ -2025,6 +2367,16 @@ packet.authoritativeness (existing) = 1.0  (was ingested from a 1.0-domain by an
 | Anthropic API rejects the request due to multimodal size | Caught at the `_claude_call` level; falls back to a text-only retry that drops all `image` blocks and replaces them with `[image withheld: <alt>]` text inserts. One retry only; if that fails, surface `[turn error: ...]`. |
 | Ingest: LLM omits `source_url` from a `new_knowledge` item | Falls back to the first successful URL; warning logged. |
 | Ingest: `is_ingest_request=true` but `urls` is empty | Treated as a non-ingest turn (small-LM bug); normal `chat_turn` proceeds. Warning logged on the extraction trace. |
+| Upload: file not found / unreadable | `read_document` raises `DocumentError("file_not_found")` or `DocumentError("permission_denied")`. `_handle_document_upload` includes the reason in the reply; no memory mutation for that file; other files in `file_paths` continue. |
+| Upload: file > `ingest_doc_max_file_bytes` | `DocumentError("file_too_large")`. Same as above. |
+| Upload: unsupported extension / wrong MIME | `DocumentError("unsupported_format")`. Coco mentions which formats she can read. |
+| Upload: PDF has no extractable text (scanned image-only) | Pages yield `(n, "")`. Once `ingest_doc_classifier_sample_pages` consecutive empty pages have passed, `_handle_document_upload` aborts the file with "couldn't extract text — looks like a scanned/image-only PDF" (OCR fallback is deferred work). |
+| Upload: document-type classifier returns malformed JSON | Default to `"word_processing"` with a warning; the wrong chunking strategy is recoverable (the LLM still emits per-paragraph routing decisions); trace records `classifier_fallback=true`. |
+| Upload: a single page in the middle of a long document fails to parse | The reader yields `(page_number, "")` and continues. The empty page generates no chunk; page numbering stays accurate; trace counter `pages_failed` is incremented. |
+| Upload: file exceeds `ingest_doc_max_pages` | Reader stops yielding at the cap; the final summary mentions the truncation ("read 500 of ~1200 pages; rerun to extend"). |
+| Upload: `is_upload_request=true` AND `is_ingest_request=true` (small-LM bug — they're meant to be mutually exclusive) | Upload takes precedence. Warning logged on the extraction trace. |
+| Upload: LLM batch response cannot be parsed | The batch is logged + skipped; chunks in it are recorded as "processed but no new knowledge". The next batch proceeds normally. |
+| Upload: `new_knowledge[i].chunk_ref` does not map to any chunk in the current batch | The item is dropped with a warning; the streamed reply still includes it. No `PacketSource` is fabricated. |
 | Auth: user cancels login (Ctrl-C, declined consent) | If `startup_mode=="prompt"`, re-prompt. If `startup_mode=="authenticated"` and `auth.fallback_to_anonymous` is true, log a warning and proceed as `ANONYMOUS`. Otherwise raise `AuthError` → `[startup error: login cancelled]` and exit non-zero. |
 | Auth: IdP returns no email claim | Identity cannot be completed. Same fallback rules as above (re-prompt / anonymous / exit). |
 | Auth: Entra token has no `roles` claim and no matching group | Falls through to `lookup_role_for_email`, then to `auth.default_role`. No error. Warning logged on the `auth` span with the empty-claim reason. |
@@ -2060,7 +2412,19 @@ packet.authoritativeness (existing) = 1.0  (was ingested from a 1.0-domain by an
 | Time to first reply token | 1–3 s (fetch) + 300–600 ms (Sonnet TTFB; multimodal adds marginal cost) | timeout-bounded |
 | Total ingest turn | 3–8 s typical | `ingest_request_timeout_s` + reply duration |
 
-**Disk writes per turn:** ≤ 5 (one per retrieved packet's event log) + 1 per integrate-on-write + 1 per new packet creation. Ingest adds 1 per affected packet (same write mechanism, larger payload — `images` array can dominate the JSON size).
+**Upload envelope (per document):**
+| Resource | Typical | Cap |
+|---|---|---|
+| File size | 50 KB – 5 MB | `ingest_doc_max_file_bytes` (25 MB) |
+| Pages processed | 5–100 | `ingest_doc_max_pages` (500) |
+| Document-type classifier call | 1 (PDF only) | small LM; ~1 page-worth of input |
+| Write-path LLM calls | `ceil(num_chunks / ingest_doc_batch_chunks)` | one per batch of 10 chunks |
+| Per-chunk write-path side calls | 1 `integrate_into_packet` OR `_create_packet_from_seed` per non-filler chunk | bounded by chunks |
+| `PacketSource` records added | one per write commit (so one upload may contribute dozens of sources across many packets) | unbounded; auditable |
+| Time per page | 100–400 ms (parse + chunk + amortized share of batched LLM call) | bounded by API latency |
+| Total upload turn | 5–30 s typical for a 20-page doc; up to minutes for the 500-page cap | bounded by `ingest_doc_max_pages` |
+
+**Disk writes per turn:** ≤ 5 (one per retrieved packet's event log) + 1 per integrate-on-write + 1 per new packet creation. Ingest adds 1 per affected packet (same write mechanism, larger payload — `images` array can dominate the JSON size). Document upload adds 1 per affected packet per chunk that lands in it (the same packet can be saved multiple times during one upload as successive chunks merge in — incremental saves keep the audit trail correct even if the upload is interrupted).
 
 **Perceived latency** (after switching from `claude-agent-sdk` subprocess bridge to direct Anthropic SDK in `coco.llm`):
 - Time-to-first-token over direct HTTPS streaming: ~300-600ms for Sonnet, ~100-200ms for Haiku. (Previously 2-3s through the CLI subprocess.)
@@ -2077,6 +2441,8 @@ packet.authoritativeness (existing) = 1.0  (was ingested from a 1.0-domain by an
 - Ingested packets carry base64 images in `packet.images` (one JSON array). A packet with 5 kept images at the default cap is ~2.5 MB on disk and contributes ~5 multimodal `image` blocks (≈ same bytes) when the `full` slice loads. Watch `band_summary_max` to avoid loading the `full` slice gratuitously; the `summary` slice carries no image blocks.
 - Per-turn image-block budget is bounded by `image_blocks_max_per_turn` (default 20). When exceeded, lowest-strength packets shed their images first (text retained).
 - Future work: external image sidecar (`data/images/<sha>.b64`) so JSON loads stay cheap when most packets aren't currently being inspected. Today, all packet images are deserialized at startup with the rest of `PacketStore`.
+- Document uploads are memory-bounded by the streaming generator: at most one page (PDF), one paragraph (DOCX), or one slide (PPTX) is materialized at a time. The agent only buffers the current `ingest_doc_batch_chunks` worth of `DocumentChunk` instances before flushing to the LLM, so even a 500-page PDF stays bounded in RAM.
+- Per-chunk routing cost grows linearly with chunk count. For a 200-paragraph document at default `ingest_doc_batch_chunks=10`, that's ~20 LLM calls. Tune the batch size up to reduce calls (at the cost of larger prompts); tune it down if responses exceed model context.
 
 ## 10. Extension points
 
@@ -2089,7 +2455,10 @@ packet.authoritativeness (existing) = 1.0  (was ingested from a 1.0-domain by an
 | Per-facet strength | Move `strength_events` from `Packet` onto `TopicFacet`; update `compute_strength` callsites; update slice selection to pick per-facet |
 | Compact strength events | New `Packet` method to collapse old events into a decayed scalar + reset log; call periodically from `run_session` startup |
 | Support JS-rendered pages | Add a Playwright (or similar) fallback inside `fetch._get_html` when the static-HTTP article is below `ingest_min_article_chars`; keep the static path as the default for cost |
-| Add PDF ingestion | New branch in `fetch.fetch_url` keyed on response `content-type`; use `pypdf` or `pdfminer.six` to produce markdown + figure extraction; rest of the pipeline unchanged |
+| Add OCR fallback for image-only PDFs | In `document._iter_pdf_pages`, when a page yields empty text after `pypdf` extraction, attempt OCR via Tesseract (or a hosted vision endpoint) before yielding the empty page. Gate behind `ingest_doc_ocr_enabled` since it's slow and may add a network dep |
+| Add image / figure extraction from documents | Extend `DocumentChunk` with an optional `images: list[PacketImage]` field. The format-specific iterators (PDF via `pdfplumber`, DOCX via `python-docx.image.Image`, PPTX via `Slide.shapes`) extract figures alongside text; route them through the existing `PacketImage` / `coco-img:<id>` machinery already used by URL ingest |
+| Support additional document formats (RTF, HTML files, EPUB, ODT) | Each new format gets its own page/paragraph iterator inside `coco.document`; the document classifier short-circuits per `format` (RTF/ODT → `word_processing`, EPUB → `word_processing`, HTML → reuse the existing `fetch._walk_and_placeholder` extractor but called on local file content); plus an entry in `ingest_doc_allowed_formats` |
+| Mid-document type re-classification | Today the classifier sees only the first ~3 pages. For mixed-content documents (slide deck embedded in a longer report) the choice is locked. Future: classify per chapter / per N-page window; switch chunking strategy mid-stream when the document type changes |
 | Lazy image storage | Move base64 out of `packet.images` into a sidecar `data/images/<sha>.b64` referenced by `PacketImage.id`; resolve at slice-load time. Markdown references (`![alt](coco-img:img_<id>)`) stay unchanged |
 | Orphan-image GC | New `Packet.unreferenced_image_ids()` method already in place; sweep packets periodically and drop `PacketImage`s whose ids don't appear in `content.full` |
 | Image retrieval channel | Embed `PacketImage.alt` (or run a CLIP-like vision embedder over the bytes); add Channel D to RRF; queries that mention visual concepts can then hit the right packet directly |

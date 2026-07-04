@@ -19,11 +19,42 @@
   "anthropic_model": "claude-sonnet-4-5",
   "small_lm_model": "claude-haiku-4-5",
   "data_dir": "./data",
-  "user_name": "the user",
   "streaming_debounce_ms": 350,
   "streaming_words_per_partial": 5,
   "streaming_min_chars": 12,
   "streaming_max_partials_per_turn": 8,
-  "debug_print_state": false,
-  "debug_print_streaming": false
+  "debug_print_state": true,
+  "debug_print_streaming": true,
+
+  "auth": {
+    "startup_mode": "prompt",
+    "providers": ["anonymous", "entra", "google"],
+    "default_role": "user",
+    "fallback_to_anonymous": true,
+    "entra": {
+      "tenant_id": null,
+      "client_id": null,
+      "scopes": ["openid", "profile", "email", "User.Read"],
+      "flow": "device_code"
+    },
+    "google": {
+      "client_id": "1015345209482-d2pr49bl6ci88usenq2uak7133uij9pb.apps.googleusercontent.com",
+      "scopes": ["openid", "profile", "email"],
+      "redirect_uri": "http://localhost:53682/callback"
+    },
+    "email_role_map": {
+      "shishircc@gmail.com": "admin"
+    },
+    "entra_group_role_map": {},
+    "role_capabilities": {}
+  },
+
+  "domain_authoritativeness": {
+    "en.wikipedia.org": 1.0,
+    "docs.python.org":  1.0,
+    "medium.com":       0.4,
+    "reddit.com":       0.2
+  },
+  "default_domain_authoritativeness": 0.5,
+  "authoritativeness_bias_scale":     0.001
 }

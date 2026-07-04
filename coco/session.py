@@ -1,10 +1,19 @@
 import uuid
 import numpy as np
 
+from .auth import Identity, ANONYMOUS
+
 
 class Session:
-    def __init__(self, session_id: str | None = None):
+    def __init__(
+        self,
+        session_id: str | None = None,
+        user: Identity | None = None,
+    ):
         self.id = session_id or "ses_" + uuid.uuid4().hex[:12]
+        # `user` is acquired once at startup by `auth.acquire_identity` and is
+        # immutable for the session — re-auth requires restarting Coco.
+        self.user: Identity = user or ANONYMOUS
         self.topics: list[dict] = []  # {topic_text, topic_vector, first_seen_turn, last_seen_turn}
         self.current_topic_idx: int | None = None
         self.loaded_packets: dict[str, dict] = {}  # packet_id -> {packet, slice}

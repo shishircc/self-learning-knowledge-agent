@@ -57,17 +57,33 @@ def observation(name: str, as_type: str = "span", input=None, metadata=None, mod
 
 
 @contextmanager
-def session_context(session_id: str, user_id: str | None = None):
-    """Bind subsequent spans to a Langfuse session (and optional user). No-op if disabled."""
+def session_context(
+    session_id: str,
+    user_id: str | None = None,
+    metadata: dict | None = None,
+):
+    """Bind subsequent spans to a Langfuse session (and optional user + metadata).
+
+    Metadata propagates as OTel baggage so all child spans pick it up; used to
+    record role / role_authoritativeness / provider for trust-aware analysis.
+    No-op when tracing is disabled.
+    """
     if not _enabled:
         yield
         return
     from langfuse import propagate_attributes
-    kwargs = {"session_id": session_id}
+    kwargs: dict = {"session_id": session_id}
     if user_id:
         kwargs["user_id"] = user_id
-    with propagate_attributes(**kwargs):
-        yield
+    if metadata:
+        kwargs["metadata"] = metadata
+    try:
+        with propagate_attributes(**kwargs):
+            yield
+    except TypeError:
+        # Older langfuse may not accept `metadata=`; fall back without it.
+        with propagate_attributes(session_id=session_id, user_id=user_id):
+            yield
 
 
 def update(obs, **kwargs):

@@ -4,6 +4,17 @@ from rank_bm25 import BM25Okapi
 from .embeddings import cosine_similarity
 
 
+def authoritativeness_bias(authoritativeness: float, scale: float) -> float:
+    """Small linear term added to the RRF final score so high-trust packets
+    break ties between equally-relevant candidates. See DESIGN.md §5.10.
+
+    The scale is intentionally tiny (default 0.001) — sharp semantic matches
+    should still win over a weakly-relevant but high-trust packet.
+    """
+    a = max(0.0, float(authoritativeness or 0.0))
+    return float(scale) * a
+
+
 def tokenize(text: str) -> list[str]:
     return text.lower().split()
 
@@ -154,6 +165,29 @@ def best_packet_facet_match(query_vec: np.ndarray, packets: list):
     return best_packet, best_score
 
 
+def rank_packet_facet_candidates(
+    query_vec: np.ndarray, packets: list, top_n: int = 5
+) -> list[tuple]:
+    """Rank packets by max-facet cosine; return top_n as [(packet, score, best_facet_text), ...]."""
+    if not packets:
+        return []
+    rows: list[tuple] = []
+    for p in packets:
+        if not p.topics:
+            rows.append((p, 0.0, ""))
+            continue
+        best_facet_text = p.topics[0].text
+        best = -1.0
+        for f in p.topics:
+            s = cosine_similarity(query_vec, f.vec_np())
+            if s > best:
+                best = s
+                best_facet_text = f.text
+        rows.append((p, float(best), best_facet_text))
+    rows.sort(key=lambda r: -r[1])
+    return rows[:top_n]
+
+
 def best_scratchpad_match(query_vec: np.ndarray, entries: list, threshold: float):
     """Returns (best_entry, score) if best meets threshold, else (None, best_score)."""
     if not entries:
@@ -168,3 +202,14 @@ def best_scratchpad_match(query_vec: np.ndarray, entries: list, threshold: float
     if best_score >= threshold:
         return best, best_score
     return None, best_score
+
+
+def rank_scratchpad_candidates(
+    query_vec: np.ndarray, entries: list, top_n: int = 3
+) -> list[tuple]:
+    """Rank scratchpad entries by topic cosine; returns [(entry, score), ...]."""
+    if not entries:
+        return []
+    rows = [(e, float(cosine_similarity(query_vec, e.topic_vec_np()))) for e in entries]
+    rows.sort(key=lambda r: -r[1])
+    return rows[:top_n]

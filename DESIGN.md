@@ -4,7 +4,7 @@ A conversational agent that learns from the conversations she has. Knowledge get
 
 This document is the source of truth for the conceptual design. Implementation choices (runtime, embedding model, libraries) are tracked separately.
 
-**v2 change vs v1:** packets now have *multiple* topic facets (each with its own vector) and a separate *entity list* — making memory multi-entry-point rather than single-handle. Retrieval becomes a three-channel RRF (topic BM25, topic max-cosine, entity BM25). Write path gains a "new facet vs new packet" decision. Coco can also **ingest URLs** as conversational content — the user says "read this" with a link and the fetched page flows through the normal write path, with content-bearing images embedded inline as base64. Coco also gains **identity-aware multi-user operation**: anonymous or SSO (Microsoft Entra / Google) login at startup; roles carry a *capability set* (binary access checks) and a scalar *authoritativeness* (trust); every packet records source provenance (URL or speaker) so conflict resolution and retrieval ranking can prefer higher-trust knowledge. v1 data is discarded (clean break).
+**v2 change vs v1:** packets now have *multiple* topic facets (each with its own vector) and a separate *entity list* — making memory multi-entry-point rather than single-handle. Retrieval becomes a three-channel RRF (topic BM25, topic max-cosine, entity BM25). Write path gains a "new facet vs new packet" decision. Coco can also **ingest URLs** as conversational content — the user says "read this" with a link and the fetched page flows through the normal write path, with content-bearing images embedded inline as base64. Coco also **uploads documents** (PDF, DOCX, PPTX) as a third source of knowledge — the file is read in streaming fashion, the LLM judges whether it's a word-processing or presentation-style document, and content is split paragraph-by-paragraph (or slide-by-slide) into chunks that each route through the normal write path. Coco also gains **identity-aware multi-user operation**: anonymous or SSO (Microsoft Entra / Google) login at startup; roles carry a *capability set* (binary access checks) and a scalar *authoritativeness* (trust); every packet records source provenance (URL, speaker, or uploaded file) so conflict resolution and retrieval ranking can prefer higher-trust knowledge. v1 data is discarded (clean break).
 
 ---
 
@@ -46,14 +46,19 @@ Packet
   created_at, updated_at, source_session_ids
 
 PacketSource
-  type:                "url" | "conversation"
+  type:                "url" | "conversation" | "document"
   url:                 str | None                URL after redirects (type=url)
-  domain_authoritativeness: float | None         resolved from config; None for conversation
-  speaker_name:        str | None                from Identity.name   (type=conversation)
-  speaker_email:       str | None                from Identity.email  (type=conversation)
-  speaker_role:        str | None                from Identity.role   (type=conversation, url)
+  domain_authoritativeness: float | None         resolved from config; None for conversation/document
+  filename:            str | None                original filename            (type=document)
+  document_type:       str | None                "word_processing" | "presentation"  (type=document)
+  page_number:         int | None                1-based page index          (type=document)
+  paragraph_index:     int | None                0-based paragraph within page (type=document, WP)
+  file_authoritativeness:  float | None          resolved from config; None for url/conversation
+  speaker_name:        str | None                from Identity.name   (all types: who introduced this)
+  speaker_email:       str | None                from Identity.email  (all types)
+  speaker_role:        str | None                from Identity.role   (all types)
   role_authoritativeness:      float             writer's role authoritativeness at write time
-  effective_authoritativeness: float             max(role_auth, domain_auth or 0)
+  effective_authoritativeness: float             max(role_auth, domain_auth or file_auth or 0)
   recorded_at:         ISO-8601
 
 PacketImage
@@ -273,6 +278,83 @@ The framing is deliberately conversational: an ingested URL is not a special "do
 
 ---
 
+## Document ingestion
+
+Coco accepts file uploads (PDF, DOCX, PPTX, plain text / markdown) as a third source of knowledge, alongside conversation and URLs. The flow mirrors URL ingestion philosophically — same conversational verb ("read this file", "upload this", "add this document"), same `new_knowledge` write-path — but differs in three ways the conceptual model has to make room for:
+
+1. **Streaming.** A 100-page PDF cannot be shoved into one LLM call. The file is read **page-by-page** as a stream; packets are written as soon as the next batch of content is ready, not after the whole document is parsed.
+2. **Document-type detection.** PDFs come in two flavours that need different chunking: word-processing-style (long prose paragraphs, narrative flow) and presentation-style (slide layout, short bullets, one self-contained idea per page). The first few pages of extracted text are sent to the small LM, which classifies the document as `word_processing` or `presentation`. Native DOCX → always `word_processing`; native PPTX → always `presentation`; the classifier only fires when the format is ambiguous (PDF). Once classified, the chunking strategy is locked for the rest of the document.
+3. **Paragraph-level routing.** Where URL ingestion processes one whole page as one LLM call, document ingestion splits content into *chunks* (paragraphs for WP, slides for presentations) and routes **each chunk individually** through the write-path. One PDF can produce many packets, or extend many existing packets, or both — knowledge from page 3 about "Alka" merges into the existing "Alka" packet while page 17 on "Delhi" creates a new packet. This finer granularity is what makes documents associative with the rest of memory rather than dropping in as one monolithic packet per file.
+
+**The framing is conversational.** An uploaded document is not a special "document" in a separate store. It produces ordinary `new_knowledge` candidates that route through the same integrate-vs-new-packet decision Coco uses for every other write. Per-write provenance lands in `packet.sources` as `PacketSource(type="document", filename, page_number, paragraph_index, document_type, ...)` so a packet about Alka enriched from three different documents carries an honest audit trail of which paragraph in which file contributed what.
+
+**Pipeline (when the user uploads a file with explicit intent — "read this", "upload this", "add this to your knowledge"):**
+
+```
+1. Identify the file. Format inferred from extension; MIME sniffed as a backstop.
+   Reject unsupported formats with a brief reply ("I can read PDF / DOCX / PPTX /
+   text / markdown right now"). Resolve file_authoritativeness from config
+   (filename glob + path prefix; longest-match wins; default = 0.5).
+
+2. Open the file. Use the format-appropriate streaming reader:
+     - PDF      → pypdf, yields one page of text at a time.
+     - DOCX     → python-docx, yields paragraphs in order.
+     - PPTX     → python-pptx, yields slides (one chunk per slide).
+     - .txt/.md → buffered file read, split into paragraph chunks.
+
+3. Detect document type (PDF only; other formats imply the type).
+   Read the first ~3 pages. Small LM call: classify as
+   "word_processing" or "presentation". Lock for the rest of the document.
+
+4. Chunk:
+     - word_processing → split each page's text into paragraphs
+       (double-newline boundaries; merge tiny paragraphs with neighbours;
+        split paragraphs > max_paragraph_chars at sentence boundaries).
+     - presentation   → one chunk per page/slide.
+   Yield chunks lazily — the reader does not have to finish the file before
+   chunking starts.
+
+5. Stream chunks into the main reply LLM in batches (e.g. 10 chunks).
+   Each batch produces:
+     - A short progress reply ("processed pages 1-3 — saved 2 packets, updated 1")
+       streamed to stdout so the user sees forward motion.
+     - A list of new_knowledge items, each tagged with the originating chunk's
+       paragraph_index + page_number + document_type.
+
+6. Route each new_knowledge item through the standard write-path
+   (best-facet match → integrate vs new packet; ingest skips the
+   scratchpad-only outcome, same as URL ingest).
+   Each commit appends a PacketSource(type="document", ...) carrying the
+   chunk's coordinates.
+
+7. After the stream completes, surface a final summary:
+   "Read N pages of <filename>. Created K packets, updated M, skipped P filler chunks."
+```
+
+**Document-type detection rationale.** Word-processing prose and presentation slides chunk *very* differently. A 60-word slide is a complete idea on its own (one packet candidate); a 60-word paragraph in a book chapter is part of a larger argument. Forcing one chunking rule on both gives bad packets either way — slides get conflated, prose paragraphs get fragmented. Letting the small LM make this call early is much cheaper than running both strategies and reconciling.
+
+**Why paragraph-level granularity, not whole-document.** A single LLM call over a whole PDF would be cheaper but loses the per-paragraph routing that lets one document enrich many existing packets. The compromise is to batch (10ish chunks per LLM call) instead of doing one call per paragraph — the LLM still decides per-paragraph (which integrates, which is filler, which creates a new packet), but the per-call cost stays bounded.
+
+**Filler skipping.** Tables of contents, page numbers, footers, bibliography entries, and other non-knowledge content surface in extracted text. The LLM is told to skip these (they produce no `new_knowledge` item). The chunk is recorded as "processed but no new knowledge" so progress accounting stays honest.
+
+**File authoritativeness.** Mirroring `domain_authoritativeness`, the config maps filename patterns (glob) and/or path prefixes to trust scalars in `[0, 1]`:
+
+```jsonc
+"file_authoritativeness": {
+  "acme-handbook-*.pdf":         0.9,
+  "/policies/":                  0.8,
+  "*.draft.pdf":                 0.3
+}
+```
+
+Resolution: longest-match wins (path prefix beats bare glob if both match); falls back to `default_file_authoritativeness` (default `0.5`). Effective trust for a document write becomes `max(role_authoritativeness, file_authoritativeness)` — same `max` rule as URL ingest, with file replacing domain.
+
+**Why glob + path, not just filename.** A deployment that organizes uploads under `data/uploads/policies/` and `data/uploads/drafts/` should be able to declare trust by folder. A filename-only map forces every individual file to be listed. Path prefixes give bulk-level policy; globs handle name-pattern conventions ("anything labelled `*.draft.pdf` is low-trust").
+
+**Streaming UX.** Long documents take time. Coco streams progress to stdout as each batch completes (`processed pages 4-6 — saved 1 packet, updated 2`) so the user sees forward motion rather than a multi-minute hang. The streamed reply also doubles as the trace narrative — at the end of the turn, the user has a paragraph summary of what changed.
+
+---
+
 ## Identity & roles
 
 Coco runs in one of two startup modes:
@@ -328,18 +410,28 @@ Default capability map (overridable in `config.auth.role_capabilities`):
 
 **Where identity lives.** The acquired identity is attached to the `Session` once at startup and propagated to Langfuse traces (`user_id` = email-or-name, `role` and `role_authoritativeness` as metadata). Identity also rides through to the *packets a user writes* — every packet records the source(s) of its knowledge (see next section), so per-packet writer attribution is no longer deferred: it is the substrate for conflict resolution and trust-weighted retrieval.
 
+**Identity in the agent's context — the user's name (and profile) is known from turn one.** As soon as login completes, the identity's `name` is spliced into Coco's main-reply system prompt at every turn ("You are Coco, a self-learning conversational assistant for **Shishir Choudhary**…"). When available, `email` and `role` are surfaced alongside the name so Coco has a self-contained picture of who she is talking to. This means:
+
+- **No re-introductions.** After a fresh SSO login Coco can greet the user by name in the very first turn — she doesn't need the user to type "hi, I'm Shishir" for her to know. `banner_welcome(identity.name)` at startup and the system-prompt splice both use the same source (`Session.user.name`).
+- **Self-referential retrieval works out of the box.** Packets whose facets or entities are keyed on the user's own name ("Shishir's family members", entity `"shishir"`) become naturally in-scope: the entity is *already* present in the agent's context each turn, so the small LM's novelty check and the retrieval channels line up with what Coco actually knows about the current speaker.
+- **Anonymous mode stays honest.** In anonymous mode `identity.name` is the literal string `"anonymous"`; the system prompt phrasing degrades gracefully ("…assistant for the user") rather than inventing a name Coco doesn't have. Coco is instructed not to *claim* to know an anonymous user's identity.
+- **Profile info beyond the name.** `email` is not surfaced into the reply prompt by default (it's stored on `Session.user` and appears in provenance / traces) — the design assumes emails don't add value to conversational reply framing. Deployments that want richer context (role label, team, department claim from Entra) can extend the system-prompt splice via a small `identity_context_block(Identity) -> str` helper; the default renders just the display name.
+
+Design intent: the moment a user signs in, Coco should treat their name (and the fact of their being logged in) as ambient knowledge — the same way a colleague who just shook your hand doesn't need to keep asking your name mid-conversation.
+
 ---
 
 ## Knowledge source provenance & effective authoritativeness
 
 Every packet records *where its knowledge came from*. This is what makes role authoritativeness actually load-bearing — without provenance, the trust scalar has nothing to attach to.
 
-**Two source types** are tracked per write event into a packet:
+**Three source types** are tracked per write event into a packet:
 
 - **URL source** — when the knowledge came from URL ingestion. Carries the absolute URL (after redirects) and the *domain authoritativeness* (see below).
 - **Conversation source** — when the knowledge came from chat. Carries the speaker's `name`, `email`, `role`, and the role's authoritativeness *at the time of writing*.
+- **Document source** — when the knowledge came from an uploaded file (PDF / DOCX / PPTX / text). Carries the `filename`, the detected `document_type` (`word_processing` or `presentation`), the `page_number` and `paragraph_index` of the chunk that produced this write, and the resolved *file authoritativeness*.
 
-Sources accumulate on the packet's `sources` list (append-only). One packet that started as a Wikipedia ingestion and later gets corroborated by a chat conversation will carry both — neither is overwritten by the other.
+Sources accumulate on the packet's `sources` list (append-only). One packet that started as a Wikipedia ingestion and later gets corroborated by a chat conversation AND a paragraph from an uploaded PDF will carry all three — none is overwritten by the others.
 
 **Domain authoritativeness.** Web sources are not equal. Wikipedia, an internal company knowledge base, and a random forum post should not be trusted identically just because they all came through `fetch_url`. The deployment config maps domain (or domain + path prefix) patterns to trust scalars in `[0, 1]`:
 
@@ -359,12 +451,17 @@ Resolution is longest-prefix match against the host + path of the URL. URLs that
 **Effective authoritativeness of a write.** When new content lands in a packet, the system computes:
 
 ```
-effective_authoritativeness = max(role_authoritativeness, domain_authoritativeness)
+effective_authoritativeness = max(role_authoritativeness, source_trust)
+
+where source_trust is:
+  - domain_authoritativeness   if PacketSource.type == "url"
+  - file_authoritativeness     if PacketSource.type == "document"
+  - 0                          if PacketSource.type == "conversation"
 ```
 
-The `max` is deliberate. The example in the requirements is the canonical case: an `author` (role auth `0.8`) ingests Wikipedia (domain auth `1.0`). The author themselves doesn't deserve `1.0` trust, but they are pointing the system at a source that does — and the *source* is what backs the fact, not the person who pasted the link. Conversely, an `admin` (role auth `1.0`) speaking from memory in chat carries trust `1.0` even though there is no URL — their role *is* the source.
+The `max` is deliberate. The canonical URL case: an `author` (role auth `0.8`) ingests Wikipedia (domain auth `1.0`) → effective `1.0`. The same shape applies for documents: an `author` uploading `acme-handbook-v3.pdf` (file auth `0.9` per the config) writes content at trust `0.9`. Conversely, an `admin` (role auth `1.0`) speaking from memory in chat carries trust `1.0` even though there is no URL or file — their role *is* the source. The source-trust term only ever *raises* the trust beyond the role's; it never drags it down.
 
-For conversation-only writes there is no domain term, so `effective_authoritativeness = role_authoritativeness` plainly.
+For conversation-only writes there is no domain or file term, so `effective_authoritativeness = role_authoritativeness` plainly.
 
 **Per-packet aggregate trust.** A packet's overall authoritativeness is the *maximum* effective trust across all its sources:
 
@@ -531,6 +628,14 @@ A conversation about Alka's parents matches via the "Alka's family" facet — ev
 | Image size cap | Downscale to `image_max_dim`; drop if post-downscale > `image_max_bytes` | Bound per-packet storage; avoids absurd 10MB hero photos eating slice budget without information gain |
 | Fetch backend | httpx + readability-lxml + markdownify; no JS rendering in v1 | Most knowledge-bearing pages serve usable HTML; a Playwright fallback is deferred work |
 | Ingest placement in turn | Skill called inside `_chat_turn_inner` before main_reply | The reply LLM needs the fetched content as context to summarize and emit `new_knowledge`; pre-fetching in streaming would have to predict intent mid-typing |
+| Document ingestion as a separate skill | New `skill.upload_document` capability; trigger detected by the streaming small LM ("read this file", "upload this", "add this document") with a path | Files are a fundamentally different surface from URLs (local read, not network; possible large size; needs format-specific parsers); a separate capability and code path keeps both pipelines clean |
+| PDF document-type detection | Small LM classifies first ~3 pages as `word_processing` vs `presentation`; result locks chunking strategy for the rest of the document | A prose paragraph and a presentation slide chunk *very* differently; one rule for both gives bad packets either way. Running once up-front is cheap; native DOCX/PPTX skip the classifier entirely |
+| Document chunking granularity | WP → paragraph; presentation → slide | Each chunk should be the smallest *self-contained* unit of knowledge for that format. Paragraphs are the natural prose unit; slides are the natural presentation unit |
+| Document write loop | Stream chunks in batches (~10) to the main LLM; each chunk routes independently through the write-path | One LLM call per paragraph would be too expensive at 100+ paragraphs; one call for the whole document loses per-paragraph routing. Batching is the cost/granularity midpoint |
+| Streaming progress UX | Inline progress chunks ("processed pages 4-6 — saved 1, updated 2") streamed as the doc is processed | Long documents take time. The user needs visible forward motion; the streamed narrative also doubles as a self-summarizing audit log of what changed |
+| Document provenance | New `PacketSource` type `"document"` with `filename`, `document_type`, `page_number`, `paragraph_index`, `file_authoritativeness` | One uploaded PDF can contribute to many packets; per-chunk coordinates make the audit trail honest about *which* paragraph in *which* file backed a fact |
+| File authoritativeness | Config-driven map of filename glob / path prefix → trust scalar in `[0, 1]`; longest-match wins | Matches the domain-authoritativeness pattern. Path prefixes let policy live at folder granularity (`/policies/` is high-trust); globs handle name conventions (`*.draft.pdf` is low-trust) |
+| Filler skipping | LLM is told to drop chunks that are tables of contents, page numbers, footers, bibliography lines (no `new_knowledge` item produced) | Extracted text from PDFs is full of structural noise that has no place in long-term memory; the LLM is the cheapest classifier we already have in the loop |
 | Authentication shape | Two startup modes (anonymous, authenticated) + pluggable SSO via config | Personal installs run anonymous; deployments with multiple users get IdP-grade login without invading the core memory model |
 | SSO providers | Microsoft Entra (corporate) + Google (public/social); list controlled by `config.json` | Matches the two real audiences — corporate teams and personal/public users — without baking either into the core. Other social IdPs follow the Google pattern |
 | Role source | Entra: ID-token claims (App Roles / groups); other providers: email→role config map | Mirrors how each provider expects to be the source of truth. Entra owns corporate role tables; Google does not surface roles, so the config fills the gap |
@@ -538,6 +643,7 @@ A conversation about Alka's parents matches via the "Alka's family" facet — ev
 | Naming: "authoritativeness" not "power" | Names the *use*: how much trust knowledge from this role carries | "Power" suggested permissions; authoritativeness pins the scalar to the actual semantic — source trust |
 | Anonymous permitted | Anonymous role with authoritativeness 0.0; can be offered alongside SSO or used as the sole mode | Some installs want fully open conversational use; trust-weighted decisions still degrade anonymous contributions automatically |
 | Where identity lives | On `Session.user` + propagated to Langfuse trace metadata + recorded on every packet write as a `PacketSource` | Identity is session-scoped at runtime *and* attribution-scoped at the packet level — per-write provenance is now first-class, not deferred |
+| User name in the agent's context | On login, `Identity.name` (from SSO claims — display name for Entra / Google) is spliced into Coco's main-reply system prompt every turn; anonymous mode falls back to `"the user"` | Coco should know who she is talking to from turn 1 — greet by name, resolve self-referential packets (`entities: ["shishir"]`), avoid asking "and you are…?" the user just answered via SSO. Reads name from `Session.user.name`, not from a config string, so multi-user deployments work correctly |
 | Hard vs soft gates | Two layers per role: a capability set (binary checks at call sites) + `role_authoritativeness` (scalar for conflict resolution, retrieval bias, trust accounting) | Some decisions are binary (delete? call skill?), others are smooth (which source wins a contradiction? trust of stored knowledge?); keeping both prevents one concept from bending in both directions |
 | Per-packet source provenance | Every write into a packet appends a `PacketSource` record (type: URL or conversation; identity; domain auth or role auth) | Without provenance the trust scalar has nothing to attach to. Sources accumulate so a packet enriched by multiple writers retains the full history |
 | Effective authoritativeness of a write | `max(role_authoritativeness, domain_authoritativeness)` | The fact is backed by whichever source is more trustworthy — the person who cited it or the site they cited. Captures the example: author (0.8) + Wikipedia (1.0) → write trust 1.0 |
@@ -556,7 +662,9 @@ A conversation about Alka's parents matches via the "Alka's family" facet — ev
 - **Orphan-image garbage collection.** Integrate-on-write may drop a `coco-img:<id>` reference from `content.full` while leaving the `PacketImage` record behind. Tolerated for now (no broken-render risk; the unused bytes just sit on disk). A periodic GC pass that removes images not referenced anywhere in `content.full` is future work.
 - **JS-rendered pages.** v1 fetch is static-HTML only. Playwright (or similar) fallback for SPA / Notion / JS-only pages is future work.
 - **Multi-page sites.** Coco ingests exactly the page the URL points to. Following outbound links, paginated articles, or whole-site crawls is out of scope for v1.
-- **Non-HTML resources.** PDFs, videos, audio, and binary downloads are rejected at fetch time. PDF ingestion (text + figures) is the natural next extension.
+- **Non-HTML URL resources.** Videos, audio, and binary URL downloads are still rejected at fetch time. (PDF / DOCX / PPTX are no longer URL-fetched — they go through the document-upload path, see "Document ingestion".) Audio / video transcription remains future work.
+- **Document images and tables.** v2 document ingestion handles text only. Embedded images, figures, charts, and tables in PDF/DOCX/PPTX are extracted as text where possible (alt text, OCR-free table headers) and skipped otherwise. Multimodal extraction is future work — the existing `PacketImage` machinery from URL ingest is the natural target to wire in.
+- **OCR for image-only PDFs.** Scanned PDFs without an embedded text layer surface as empty pages and are skipped. A Tesseract (or hosted OCR) fallback is future work.
 - **Strength event compaction.** The `strength_events` log grows monotonically. Periodic compaction (collapse old events into a decayed scalar + reset event log) is future work.
 - **Initial bootstrap.** Coco starts empty: no packets, no scratchpad. Basic facts (user's name, date) learned in the first conversation like anything else.
 - **Skills layer details.** How exactly a packet references a skill, and whether Coco autonomously invokes vs. proposes-and-asks, is left to implementation. URL ingestion is the first agent-auto-invoked skill; user-callable skills follow the same pattern.
