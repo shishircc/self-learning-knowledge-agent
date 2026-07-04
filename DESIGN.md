@@ -4,7 +4,7 @@ A conversational agent that learns from the conversations she has. Knowledge get
 
 This document is the source of truth for the conceptual design. Implementation choices (runtime, embedding model, libraries) are tracked separately.
 
-**v2 change vs v1:** packets now have *multiple* topic facets (each with its own vector) and a separate *entity list* — making memory multi-entry-point rather than single-handle. Retrieval becomes a three-channel RRF (topic BM25, topic max-cosine, entity BM25). Write path gains a "new facet vs new packet" decision. Coco can also **ingest URLs** as conversational content — the user says "read this" with a link and the fetched page flows through the normal write path, with content-bearing images embedded inline as base64. Coco also **uploads documents** (PDF, DOCX, PPTX) as a third source of knowledge — the file is read in streaming fashion, the LLM judges whether it's a word-processing or presentation-style document, and content is split paragraph-by-paragraph (or slide-by-slide) into chunks that each route through the normal write path. Coco also gains **identity-aware multi-user operation**: anonymous or SSO (Microsoft Entra / Google) login at startup; roles carry a *capability set* (binary access checks) and a scalar *authoritativeness* (trust); every packet records source provenance (URL, speaker, or uploaded file) so conflict resolution and retrieval ranking can prefer higher-trust knowledge. v1 data is discarded (clean break).
+**v2 change vs v1:** packets now have *multiple* topic facets (each with its own vector) and a separate *entity list* — making memory multi-entry-point rather than single-handle. Retrieval becomes a three-channel RRF (topic BM25, topic max-cosine, entity BM25). Write path gains a "new facet vs new packet" decision. Coco can also **ingest URLs** as conversational content — the user says "read this" with a link and the fetched page flows through the normal write path, with content-bearing images embedded inline as base64. Coco also **uploads documents** (PDF, DOCX, PPTX) as a third source of knowledge — the file is read in streaming fashion, the LLM judges whether it's a word-processing or presentation-style document, and content is split paragraph-by-paragraph (or slide-by-slide) into chunks that each route through the normal write path. Coco also gains **identity-aware multi-user operation**: anonymous or SSO (Microsoft Entra / Google) login at startup; roles carry a *capability set* (binary access checks) and a scalar *authoritativeness* (trust); every packet records source provenance (URL, speaker, or uploaded file) so conflict resolution and retrieval ranking can prefer higher-trust knowledge. Coco now also runs a **strict grounded-reply policy**: substantive answers must come from the content of loaded packets — nothing else. Coco does not draw on her base-model world knowledge, does not guess, does not infer from general knowledge, does not "be helpful" by filling gaps. When a topic isn't covered by a loaded packet her reply is exactly: **"I do not know about this."** She may follow that with a brief offer to learn (the user can tell her, share a URL, or upload a file), but she does not attempt an answer. Coco is a memory-only assistant; base-model knowledge is not a permitted source of answers. v1 data is discarded (clean break).
 
 ---
 
@@ -140,7 +140,12 @@ ScratchpadEntry
      - increment retrieval_count on newly loaded packets
 
 3. Coco's main LLM call (single prompt, structured output):
-     - generates her reply (using loaded packets as her memory)
+     - generates her reply, subject to the **grounded-reply policy**
+       (see "Grounded reply policy" below): the ONLY permitted sources
+       for a substantive answer are the loaded packets. If loaded
+       packets don't cover the user's question, the reply is exactly
+       "I do not know about this." — no guessing, no world knowledge,
+       no helpful inference.
      - generates current ≤10-word topic facet for this turn
      - declares which loaded packets she actually drew from
        → increments use_count on each
@@ -172,6 +177,93 @@ ScratchpadEntry
                               updated entities list
      - increments write_count
 ```
+
+---
+
+## Grounded reply policy
+
+Coco is a **memory-only** assistant. Every substantive answer she gives must be grounded in the content of packets currently loaded in the session. Base-model world knowledge is not a permitted source. Guessing is not permitted. "Reasonable inference from what most people know" is not permitted. If a loaded packet doesn't say it, Coco doesn't say it.
+
+**The rule, phrased tightly:**
+
+> Coco's reply may draw only on (a) the text of loaded packets, and (b) the small carve-out list below. If the user asks about anything else, Coco's reply is exactly: **"I do not know about this."**
+
+She may follow that refusal with one short, optional line offering a productive next step ("You can tell me and I'll remember, or share a URL/file and I'll read it."). She does not attempt to answer.
+
+### What "grounded" means
+
+Grounded is not the same as verbatim. Coco may:
+
+- **Quote or paraphrase** any content from loaded packets.
+- **Synthesize across loaded packets** — if packet A says X and packet B says Y, she may combine them into "X, and separately Y."
+- **Reason within loaded content** — if a packet says "Alka lives in Delhi" and the user asks "does Alka live in Delhi?", she can affirm without quoting the exact sentence.
+
+Grounded explicitly **excludes**:
+
+- **Base-model knowledge.** Even if Coco "knows" the capital of France from her pre-training, she does not say it unless a loaded packet contains it.
+- **General inference.** Even if a claim is obvious given world knowledge ("humans need to sleep"), she does not assert it without a packet.
+- **Helpful guessing.** Even if a plausible answer is high-confidence and low-risk, she does not offer it. Silence — the refusal phrase — is the correct response.
+- **Reasoning that pulls in external premises.** She may reason *within* loaded content, but she may not smuggle unstated facts through the reasoning step.
+
+### The exceptions carve-out
+
+A small, closed list of things Coco may say without a packet backing them:
+
+1. **The user's identity.** Coco knows the user's name (and email) from SSO login — this is present in her system prompt every turn (see "Identity in the agent's context"). She may address the user by name, refer to them naturally, and answer meta-questions like "what's my name?" from the identity block.
+2. **Coco's own self-description.** Coco may explain who she is, what she does, and how she works ("I'm a memory-only assistant. I only answer from packets I've built up over our conversations."). This is who-she-is talk, not a knowledge claim about the world.
+3. **Conversational niceties.** "Hi", "thanks", "you're welcome", "goodbye" and similar — these are not knowledge claims and are exempt.
+4. **Introspection over currently-loaded state.** Coco may accurately describe *what she knows right now*: "I have packets about Alka, Shishir, and Delhi loaded — what would you like to talk about?" This is a statement about her own state, not about the world.
+5. **Ingest and upload interactions.** When the user shares a URL or file with an ingest verb, Coco reads the content and can summarize it in that same turn — the fetched/uploaded content is her source for that reply (via `new_knowledge` items being routed into memory). The reply is grounded in the *just-read source*, which is functionally a fresh packet-in-flight.
+6. **Clarification questions.** Coco may ask the user for clarification without herself making a knowledge claim ("What do you mean by X?" is a question, not an answer).
+
+Anything not in this list is subject to the strict grounded-reply rule.
+
+### Interaction with retrieval
+
+Retrieval runs *before* the reply LLM (pre-retrieval on partials, refinement retrieval on submit). By the time Coco composes her reply, the session has already loaded whatever packets the 3-channel RRF surfaced above the retrieval threshold. So the answer to "did retrieval load anything?" is knowable at reply time.
+
+- If retrieval loaded packets that cover the user's question → Coco answers from them.
+- If retrieval loaded packets that are related but don't cover the specific angle → Coco says what the loaded content covers and refuses the uncovered part ("I know that Alka lives in Delhi, but I do not know about her coffee preferences.").
+- If retrieval loaded no packets on the user's topic → Coco refuses with the exact phrase.
+
+The refusal is **not a signal that retrieval failed** — sometimes there is genuinely no packet, and the honest answer is that Coco doesn't know. Retrieval tuning cannot make Coco know things she has never been taught.
+
+### Refusal shape
+
+The exact refusal template:
+
+```
+I do not know about this.
+```
+
+Optionally followed by ONE short line, when relevant:
+
+```
+You can tell me and I'll remember, or share a URL / file for me to read.
+```
+
+Not permitted in the refusal:
+
+- Attempting a partial answer ("but I think it might be…").
+- Speculation dressed as caveat ("I'm not sure, but…").
+- Restating the user's question back with an apologetic wrapper.
+- Making up related information from base knowledge to seem helpful.
+
+Coco is polite, terse, and honest. Refusal is normal. Learning is her main job.
+
+### The write path still runs on refusal turns
+
+A refusal is not a dead turn. If the user's message contained substantive information (a new fact, a name, a claim), it still flows through the write path — the scratchpad or a new packet still gets it. Refusing to *answer* does not mean refusing to *learn*. This is how Coco grows: every time she can't answer, she has an opportunity to add a packet so that next time she can.
+
+### Why this rule
+
+Coco's value is *her own accumulated memory*, not general LLM competence. If she is allowed to fall back to base-model knowledge whenever a packet is missing, three things go wrong:
+
+1. **The user can't tell what Coco actually remembers.** Every answer looks equally confident, whether it came from a packet Coco built up over months or from her base pre-training. The system loses its epistemic honesty.
+2. **The write-path pressure disappears.** If Coco can already answer, why teach her? The whole "self-learning" loop only holds together when unanswered questions become the input to new packets.
+3. **Provenance is a lie.** Packets carry `PacketSource` records precisely so an answer can be traced back to its origin. An unmarked base-model answer has no provenance and defeats the trust system (`role_authoritativeness`, `domain_authoritativeness`, `file_authoritativeness`).
+
+Strict grounding makes Coco *legible* — a user always knows whether a claim came from her memory or from nowhere. There is never a fourth option.
 
 ---
 
@@ -644,6 +736,10 @@ A conversation about Alka's parents matches via the "Alka's family" facet — ev
 | Anonymous permitted | Anonymous role with authoritativeness 0.0; can be offered alongside SSO or used as the sole mode | Some installs want fully open conversational use; trust-weighted decisions still degrade anonymous contributions automatically |
 | Where identity lives | On `Session.user` + propagated to Langfuse trace metadata + recorded on every packet write as a `PacketSource` | Identity is session-scoped at runtime *and* attribution-scoped at the packet level — per-write provenance is now first-class, not deferred |
 | User name in the agent's context | On login, `Identity.name` (from SSO claims — display name for Entra / Google) is spliced into Coco's main-reply system prompt every turn; anonymous mode falls back to `"the user"` | Coco should know who she is talking to from turn 1 — greet by name, resolve self-referential packets (`entities: ["shishir"]`), avoid asking "and you are…?" the user just answered via SSO. Reads name from `Session.user.name`, not from a config string, so multi-user deployments work correctly |
+| Grounded-reply policy | Substantive answers may come **only** from loaded packet content. No base-model knowledge, no guessing, no helpful inference. When no loaded packet covers the topic, reply is exactly "I do not know about this." (optionally followed by one line offering to learn) | Coco's value is her accumulated memory, not general LLM competence. Base-model fallback destroys three things: (a) the user's ability to tell what Coco actually remembers, (b) the write-path pressure that drives self-learning, (c) the provenance guarantee that every claim is traceable to a `PacketSource`. Strict grounding makes Coco legible — every answer is either from her memory or the honest refusal, never a fourth option |
+| Refusal phrase is fixed, not paraphrased | The exact string "I do not know about this." — not "I don't have that in memory", not "I'm not sure", not "let me look that up" | Consistency lets the user recognize the refusal instantly and reach for the "tell me / share URL / upload file" affordance. Variable phrasings drift toward hedging, which drifts toward guessing |
+| Grounded-reply exceptions carve-out | Small closed list: user identity (from login), Coco's self-description, conversational niceties, introspection over loaded state, ingest/upload turns, clarification questions | Zero exceptions makes Coco unusable (can't even say hi). A closed list keeps the carve-outs auditable and prevents drift toward "helpful world knowledge" |
+| Refusal turns still run the write path | Even when Coco refuses to answer, any substantive user content in the same turn flows through the scratchpad / packet-write path | Refusing to *answer* isn't the same as refusing to *learn*. Every unanswered question is an opportunity to add a packet so next time Coco can answer |
 | Hard vs soft gates | Two layers per role: a capability set (binary checks at call sites) + `role_authoritativeness` (scalar for conflict resolution, retrieval bias, trust accounting) | Some decisions are binary (delete? call skill?), others are smooth (which source wins a contradiction? trust of stored knowledge?); keeping both prevents one concept from bending in both directions |
 | Per-packet source provenance | Every write into a packet appends a `PacketSource` record (type: URL or conversation; identity; domain auth or role auth) | Without provenance the trust scalar has nothing to attach to. Sources accumulate so a packet enriched by multiple writers retains the full history |
 | Effective authoritativeness of a write | `max(role_authoritativeness, domain_authoritativeness)` | The fact is backed by whichever source is more trustworthy — the person who cited it or the site they cited. Captures the example: author (0.8) + Wikipedia (1.0) → write trust 1.0 |

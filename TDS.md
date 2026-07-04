@@ -230,7 +230,7 @@ class Session:
 **Public API:**
 | Symbol | Notes |
 |---|---|
-| `SYSTEM_PROMPT_TEMPLATE` | Main reply prompt (`user_name`, `loaded_packets` slots). Topic classification is owned by streaming, not this prompt. `user_name` is filled from `session.user.prompt_display_name()` — the acquired `Identity.name` for authenticated sessions, or the literal `"the user"` in anonymous mode (see §3.4). After SSO login Coco sees "…assistant for **Shishir Choudhary**…" from the very first turn. Output format is XML-tagged so the reply can be streamed to the user as it's generated: `<reply>...</reply><metadata>{packets_used, new_knowledge}</metadata>`. See §5.4. |
+| `SYSTEM_PROMPT_TEMPLATE` | Main reply prompt (`user_name`, `loaded_packets` slots). Topic classification is owned by streaming, not this prompt. `user_name` is filled from `session.user.prompt_display_name()` — the acquired `Identity.name` for authenticated sessions, or the literal `"the user"` in anonymous mode (see §3.4). After SSO login Coco sees "…assistant for **Shishir Choudhary**…" from the very first turn. The template enforces the **strict grounded-reply policy** (see §5.4a and DESIGN.md §"Grounded reply policy"): Coco may draw only on loaded packets + a small carve-out list; when no loaded packet covers the question her reply is exactly `"I do not know about this."`. Output format is XML-tagged so the reply can be streamed to the user as it's generated: `<reply>...</reply><metadata>{packets_used, new_knowledge}</metadata>`. See §5.4. |
 | `INGEST_SYSTEM_ADDENDUM` | Appended to `SYSTEM_PROMPT_TEMPLATE` when `is_ingest_request=true`. Adds instructions: (1) acknowledge the source URL, (2) reply with 2-3 takeaways, (3) emit `new_knowledge` items whose `content` references `[IMG_n]` placeholders for content-bearing images and omits placeholders for decorative ones, (4) the image manifest is authoritative — do not invent new `[IMG_n]` tokens. See §5.7. |
 | `INGEST_USER_FRAMING` | Wraps the user message when ingesting. Format: `<user_message>... original user text ...</user_message><fetched_sources><source url="..."><markdown>...</markdown><images>[IMG_1] alt="..." 124KB png 800x600 | [IMG_2] alt="..." ...</images></source></fetched_sources>`. Multiple sources if multiple URLs. |
 | `INTEGRATE_PROMPT` | Integrate-on-write prompt. Slots: `existing_facets`, `existing_entities`, `existing_content`, `existing_source_urls`, `existing_authoritativeness`, `new_content`, `new_source_url`, `new_authoritativeness`, `writer_role`. `new_source_url` is `null` for conversation-driven integrations, set when integrating ingested content. The two `*_authoritativeness` numbers drive the trust-based conflict rule: the LLM is instructed that for **conflicting facts**, the source with higher authoritativeness wins (new replaces existing if `new ≥ existing`; existing wins if `new < existing`, with the new claim recorded as a less-trusted alternate); for **non-conflicting facts**, normal merge applies. The LLM still emits `conflict_detected` when the trusts are equal — that's the only branch that escalates to the user. The LLM is told to keep `coco-img:<id>` references intact when they appear in `existing_content` or `new_content`. |
@@ -972,6 +972,32 @@ The big LM's reply is **streamed token-by-token to stdout** so the user sees the
 **Other LLM calls do NOT stream to the user:**
 - `streaming_extraction` (small LM) is a backstage call; its output goes into agent state, not stdout.
 - `integrate_on_write` and `new_packet_creation` happen after the reply is already complete; their output is silent (still traced).
+
+### 5.4a Grounded-reply policy — prompt-level enforcement
+
+DESIGN.md §"Grounded reply policy" defines the behavior; this section describes how it is enforced in code. There is no separate runtime gate — the rule lives inside `SYSTEM_PROMPT_TEMPLATE` (`coco.prompts.SYSTEM_PROMPT_TEMPLATE`), which the main reply LLM cannot override.
+
+**What the template tells the LLM:**
+
+1. Your permitted sources of answers are (a) content of loaded packets and (b) the short carve-out list (user identity, self-description, niceties, introspection over loaded state, ingest/upload turns, clarification questions).
+2. If the user's substantive question is not covered by any loaded packet, your reply MUST be exactly `"I do not know about this."` — no partial answer, no hedging, no world knowledge, no guessing.
+3. You MAY follow that with ONE short optional line offering to learn (tell me, share a URL, upload a file).
+4. Reasoning within loaded content is permitted; smuggling in unstated facts is not.
+5. The write path still runs on refusal turns — any substantive user content still produces `new_knowledge` items in `<metadata>`.
+
+**What the template does NOT do:**
+- No runtime post-check verifies grounding claims. The system trusts the reply LLM to follow the policy, and Langfuse traces record every reply for post-hoc audit (the reply text and the `packets_used` list are both captured).
+- No config toggle. Grounded-reply is always on. Deployments that need a loose "helpful assistant" mode would have to fork the template.
+
+**Interaction with `packets_used`:**
+- On a refusal turn, `packets_used` is `[]`.
+- On an answered turn, `packets_used` names the packet ids the reply drew from — the same field used to increment `use_count`. This is the single audit signal a reviewer can grep in traces to correlate "answered" vs "refused" turns with retrieval state.
+
+**Interaction with the streaming reader:**
+- The refusal phrase is short enough that it streams in one to two token deltas — the user sees `"I do not know about this."` appear virtually instantly. This is deliberate: honest quick refusals feel confident, not slow.
+
+**Test surfaces (deferred):**
+- A future eval harness will run a fixed grid of (packet-store fixture, query) pairs and check that (a) queries with no matching packet get the exact refusal string and (b) queries with a matching packet get an answer that quotes / paraphrases / synthesizes from the loaded content only. Not shipped in this revision.
 
 ### 5.5 User-facing UX (default)
 
