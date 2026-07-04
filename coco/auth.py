@@ -19,6 +19,7 @@ import asyncio
 import os
 from dataclasses import dataclass, field
 from typing import Iterable
+from fnmatch import fnmatch
 from urllib.parse import urlparse
 
 
@@ -44,21 +45,25 @@ CAPABILITIES: frozenset[str] = frozenset({
     "delete_packet",
     "force_rewrite",
     "skill.fetch_url",
+    "skill.upload_document",
 })
 
 DEFAULT_ROLE_CAPABILITIES: dict[str, frozenset[str]] = {
     "admin": frozenset({
         "read_packets", "write_scratchpad", "promote_scratchpad",
         "create_packet", "integrate_packet", "override_conflict",
-        "delete_packet", "force_rewrite", "skill.fetch_url",
+        "delete_packet", "force_rewrite",
+        "skill.fetch_url", "skill.upload_document",
     }),
     "author": frozenset({
         "read_packets", "write_scratchpad", "promote_scratchpad",
-        "create_packet", "integrate_packet", "skill.fetch_url",
+        "create_packet", "integrate_packet",
+        "skill.fetch_url", "skill.upload_document",
     }),
     "viewer": frozenset({"read_packets"}),
     "user": frozenset({
-        "read_packets", "write_scratchpad", "skill.fetch_url",
+        "read_packets", "write_scratchpad",
+        "skill.fetch_url", "skill.upload_document",
     }),
     "anonymous": frozenset({"read_packets"}),
 }
@@ -279,6 +284,70 @@ def effective_authoritativeness(
     role = float(role_authoritativeness or 0.0)
     domain = float(domain_authoritativeness or 0.0)
     return max(role, domain)
+
+
+def resolve_file_authoritativeness(filename: str | None, config: dict) -> float:
+    """Longest-match against config["file_authoritativeness"].
+
+    Keys may be:
+      - a filename glob   ("*.draft.pdf", "acme-handbook-*.pdf")
+      - an absolute path prefix ("/policies/", "/Users/x/uploads/policies/")
+
+    Resolution: longest key wins. Path prefixes beat globs on tie length.
+    Path-prefix match is done against the absolute path (if `filename` is
+    absolute); globs match the basename. Falls back to
+    `default_file_authoritativeness` (default 0.5) when no key matches.
+    """
+    default = float(config.get("default_file_authoritativeness", 0.5))
+    if not filename:
+        return default
+
+    mapping = config.get("file_authoritativeness") or {}
+    if not mapping:
+        return default
+
+    basename = os.path.basename(filename)
+    abs_path = filename if os.path.isabs(filename) else os.path.abspath(filename)
+
+    best_len = -1
+    best_is_prefix = False
+    best_value: float | None = None
+
+    for raw_key, raw_value in mapping.items():
+        if not isinstance(raw_key, str):
+            continue
+        key = raw_key.strip()
+        if not key:
+            continue
+
+        is_prefix = key.startswith("/") and any(c not in "*?[]" for c in key)
+        matched = False
+        if is_prefix:
+            if abs_path.startswith(key):
+                matched = True
+        else:
+            if fnmatch(basename, key) or fnmatch(filename, key):
+                matched = True
+
+        if not matched:
+            continue
+
+        # Longest match wins; on equal length, path prefix beats bare glob.
+        key_len = len(key)
+        if (
+            key_len > best_len
+            or (key_len == best_len and is_prefix and not best_is_prefix)
+        ):
+            best_len = key_len
+            best_is_prefix = is_prefix
+            try:
+                best_value = float(raw_value)
+            except (TypeError, ValueError):
+                best_value = None
+
+    if best_value is None:
+        return default
+    return max(0.0, min(1.0, best_value))
 
 
 # ---------------------------------------------------------------------------

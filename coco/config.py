@@ -43,6 +43,16 @@ DEFAULT_CONFIG = {
         "image/webp",
         "image/svg+xml",
     ],
+    # ---- Document upload ----
+    "ingest_doc_enabled": True,
+    "ingest_doc_allowed_formats": ["pdf", "docx", "pptx", "text", "markdown"],
+    "ingest_doc_max_file_bytes": 25_000_000,
+    "ingest_doc_max_pages": 500,
+    "ingest_doc_classifier_sample_pages": 3,
+    "ingest_doc_min_paragraph_chars": 120,
+    "ingest_doc_max_paragraph_chars": 1500,
+    "ingest_doc_batch_chunks": 10,
+    "ingest_doc_progress_interval_pages": 5,
     "image_blocks_max_per_turn": 20,
     "debug_print_state": False,
     "debug_print_streaming": False,
@@ -72,6 +82,8 @@ DEFAULT_CONFIG = {
     # ---- Source trust ----
     "domain_authoritativeness": {},
     "default_domain_authoritativeness": 0.5,
+    "file_authoritativeness": {},
+    "default_file_authoritativeness": 0.5,
     "authoritativeness_bias_scale": 0.001,
 }
 

@@ -86,14 +86,22 @@ class PacketImage:
 class PacketSource:
     """Provenance record for one write into a packet.
 
-    `effective_authoritativeness = max(role_authoritativeness, domain_authoritativeness or 0)`
+    `effective_authoritativeness = max(role_authoritativeness, source_trust or 0)`
     is computed at construction time so the trust scalar is recorded as it
     was at write time (config changes later don't retroactively shift it).
+    `source_trust` is `domain_authoritativeness` for URLs, `file_authoritativeness`
+    for documents, and 0 for plain conversation.
     """
 
-    type: str  # "url" | "conversation"
+    type: str  # "url" | "conversation" | "document"
     url: str | None = None
     domain_authoritativeness: float | None = None
+    # Document-source fields (all None for url / conversation).
+    filename: str | None = None
+    document_type: str | None = None  # "word_processing" | "presentation"
+    page_number: int | None = None
+    paragraph_index: int | None = None
+    file_authoritativeness: float | None = None
     speaker_name: str | None = None
     speaker_email: str | None = None
     speaker_role: str | None = None
@@ -137,6 +145,35 @@ class PacketSource:
             recorded_at=now_iso(),
         )
 
+    @classmethod
+    def from_document(
+        cls,
+        filename: str,
+        document_type: str,
+        page_number: int | None,
+        paragraph_index: int | None,
+        file_authoritativeness: float | None,
+        writer: "Identity",
+    ) -> "PacketSource":
+        role_auth = float(writer.role_authoritativeness or 0.0)
+        f_auth = float(file_authoritativeness or 0.0)
+        return cls(
+            type="document",
+            url=None,
+            domain_authoritativeness=None,
+            filename=filename,
+            document_type=document_type,
+            page_number=page_number,
+            paragraph_index=paragraph_index,
+            file_authoritativeness=f_auth,
+            speaker_name=writer.name,
+            speaker_email=writer.email,
+            speaker_role=writer.role,
+            role_authoritativeness=role_auth,
+            effective_authoritativeness=max(role_auth, f_auth),
+            recorded_at=now_iso(),
+        )
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -146,6 +183,11 @@ class PacketSource:
             type=d.get("type", "conversation"),
             url=d.get("url"),
             domain_authoritativeness=d.get("domain_authoritativeness"),
+            filename=d.get("filename"),
+            document_type=d.get("document_type"),
+            page_number=d.get("page_number"),
+            paragraph_index=d.get("paragraph_index"),
+            file_authoritativeness=d.get("file_authoritativeness"),
             speaker_name=d.get("speaker_name"),
             speaker_email=d.get("speaker_email"),
             speaker_role=d.get("speaker_role"),
