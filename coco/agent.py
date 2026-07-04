@@ -10,7 +10,7 @@ import sys
 from datetime import datetime, timezone
 import numpy as np
 
-from . import auth, fetch as fetch_module
+from . import auth, documents as documents_module, fetch as fetch_module
 from . import streaming, tracing, ui
 from .auth import (
     AuthError,
@@ -33,6 +33,7 @@ from .memory import (
     SessionCounter,
 )
 from .prompts import (
+    build_document_batch_user_blocks,
     build_system_prompt,
     build_user_content_blocks,
     parse_integration_response,
@@ -1048,6 +1049,490 @@ async def _handle_ingest(
 
 
 # -----------------------------------------------------------------------------
+# Document upload
+# -----------------------------------------------------------------------------
+
+async def _handle_document_upload(
+    user_message: str,
+    file_paths: list[str],
+    session: Session,
+    store: PacketStore,
+    scratchpad: Scratchpad,
+    config: dict,
+    session_n: int,
+) -> str:
+    """Read local files (PDF / DOCX / PPTX / text / markdown) as a stream of
+    DocumentChunks, batch them through the main-reply LLM, and route each
+    new_knowledge item through the standard write path.
+    """
+    with tracing.observation(
+        "document_upload",
+        as_type="span",
+        input={"file_paths": file_paths, "user_message": user_message},
+    ) as span:
+        session.add_turn("user", user_message)
+        batch_size = int(config.get("ingest_doc_batch_chunks", 10))
+        threshold = config["existing_packet_match_threshold"]
+        debug_wp = config.get("debug_print_write_path", False)
+
+        # Per-file accumulators (surfaced in the final summary and in tracing).
+        total_pages = 0
+        total_chunks = 0
+        total_batches = 0
+        total_new_packets = 0
+        total_updated_packets = 0
+        total_skipped_chunks = 0
+        opened_files: list[str] = []
+        open_errors: list[tuple[str, str]] = []
+        collected_reply_parts: list[str] = []
+
+        for raw_path in file_paths:
+            path = documents_module.expand_path(raw_path)
+            try:
+                metadata = documents_module.open_metadata(path, config)
+            except documents_module.DocumentReadError as e:
+                open_errors.append((raw_path, str(e)))
+                ui.coco_label()
+                msg = f"I couldn't open {raw_path}: {e}\n"
+                sys.stdout.write(msg)
+                sys.stdout.flush()
+                collected_reply_parts.append(msg.strip())
+                continue
+
+            opened_files.append(metadata.filename)
+            ui.coco_label()
+            opening_line = (
+                f"Reading {metadata.filename} "
+                f"({metadata.format}, {metadata.size_bytes // 1024}KB, "
+                f"trust {metadata.file_authoritativeness:.2f})...\n"
+            )
+            sys.stdout.write(opening_line)
+            sys.stdout.flush()
+            collected_reply_parts.append(opening_line.strip())
+
+            file_new_pkts = 0
+            file_updated_pkts = 0
+            file_skipped = 0
+            file_chunks = 0
+            batch: list = []
+            pages_seen: set[int] = set()
+
+            async def _flush_batch(batch_chunks: list, batch_no: int) -> None:
+                nonlocal file_new_pkts, file_updated_pkts, file_skipped, total_batches
+                if not batch_chunks:
+                    return
+                total_batches += 1
+
+                # Framing.
+                meta_for_prompt = {
+                    "filename": metadata.filename,
+                    "format": metadata.format,
+                    "document_type": metadata.document_type,
+                    "file_authoritativeness": metadata.file_authoritativeness,
+                }
+                system_prompt = build_system_prompt(
+                    session.loaded_packets_list(),
+                    user_name=session.user.prompt_display_name(),
+                    upload_mode=True,
+                )
+                user_blocks = build_document_batch_user_blocks(
+                    metadata_dict=meta_for_prompt,
+                    chunks=batch_chunks,
+                    batch_index=batch_no,
+                    total_pages_seen=len(pages_seen),
+                )
+
+                raw = await _claude_call(
+                    system_prompt,
+                    user_blocks,
+                    config["anthropic_model"],
+                    span_name="document_batch_reply",
+                    stream_to_stdout=True,
+                )
+                parsed = parse_coco_response(raw)
+                collected_reply_parts.append(parsed["reply"])
+
+                # Route each new_knowledge item.
+                chunk_by_ref = {c.chunk_ref(): c for c in batch_chunks}
+                touched_this_batch = set(chunk_by_ref.keys())
+
+                for nk in parsed["new_knowledge"]:
+                    content = (nk.get("content") or "").strip()
+                    if not content:
+                        continue
+                    chunk_ref = (nk.get("chunk_ref") or "").strip()
+                    src_chunk = chunk_by_ref.get(chunk_ref)
+                    if src_chunk is None:
+                        # Soft match on page number.
+                        if chunk_ref.startswith("P"):
+                            try:
+                                page_num = int(chunk_ref[1:].split(".")[0])
+                            except ValueError:
+                                page_num = None
+                            if page_num is not None:
+                                for c in batch_chunks:
+                                    if c.page_number == page_num:
+                                        src_chunk = c
+                                        break
+                        if src_chunk is None:
+                            src_chunk = batch_chunks[0]
+                            tracing.score(
+                                name="document_chunk_ref_missing",
+                                value=1,
+                                comment=f"chunk_ref={chunk_ref!r}",
+                            )
+
+                    implied_topic = (nk.get("implied_topic") or "").strip() or (
+                        f"content from {metadata.filename}"
+                    )
+
+                    # Track which chunks the LLM chose to write.
+                    touched_this_batch.discard(src_chunk.chunk_ref())
+
+                    # Build the document source for THIS write.
+                    doc_source = PacketSource.from_document(
+                        filename=metadata.filename,
+                        document_type=metadata.document_type,
+                        page_number=src_chunk.page_number,
+                        paragraph_index=src_chunk.paragraph_index,
+                        file_authoritativeness=metadata.file_authoritativeness,
+                        writer=session.user,
+                    )
+
+                    if debug_wp:
+                        _print_write_path_header(
+                            0, content,
+                            topic_source="LLM-supplied implied_topic",
+                            topic_text=implied_topic,
+                            ingest=True,
+                            source_url=f"{metadata.filename}#{src_chunk.chunk_ref()}",
+                        )
+
+                    topic_vec_for_match = embed(implied_topic, config["embedding_model"])
+                    all_packets = store.all()
+                    if debug_wp:
+                        ranked = rank_packet_facet_candidates(
+                            topic_vec_for_match, all_packets, top_n=5
+                        )
+                        _print_packet_candidates(ranked, threshold, ingest=True)
+                    best_pkt, best_score = best_packet_facet_match(
+                        topic_vec_for_match, all_packets
+                    )
+
+                    if best_pkt is not None and best_score >= threshold:
+                        if debug_wp:
+                            _print_packet_decision(
+                                best_pkt, best_score, threshold,
+                                route="integrate (cosine)",
+                                reason=(
+                                    f"max-facet cosine {best_score:.4f} ≥ threshold; "
+                                    f"merge chunk from {metadata.filename}"
+                                    f"#{src_chunk.chunk_ref()}"
+                                ),
+                                ingest=True,
+                            )
+                        ok = await _integrate_with_document_source(
+                            best_pkt, content, doc_source, session.user,
+                            store, config,
+                        )
+                        if ok:
+                            file_updated_pkts += 1
+                            if best_pkt.id not in session.loaded_packets:
+                                strength = compute_strength(
+                                    best_pkt.strength_events,
+                                    config["strength_weights"],
+                                    config["strength_half_life_days"],
+                                )
+                                slice_type = slice_for_strength(
+                                    strength,
+                                    config["band_gist_max"],
+                                    config["band_summary_max"],
+                                )
+                                session.loaded_packets[best_pkt.id] = {
+                                    "packet": best_pkt, "slice": slice_type,
+                                }
+                        continue
+
+                    # New packet.
+                    if debug_wp:
+                        _print_packet_decision(
+                            best_pkt, best_score if best_pkt else -1.0, threshold,
+                            route="new packet",
+                            reason=(
+                                f"no candidate cleared the threshold "
+                                f"({best_score:.4f} < {threshold:.4f}); "
+                                "upload creates a fresh packet"
+                            ),
+                            ingest=True,
+                        )
+                    new_pkt = await _create_packet_from_document(
+                        seed_topic=implied_topic,
+                        seed_content=content,
+                        seed_source=doc_source,
+                        writer=session.user,
+                        store=store,
+                        config=config,
+                        session_id=session.id,
+                    )
+                    if new_pkt is not None:
+                        file_new_pkts += 1
+                        session.loaded_packets[new_pkt.id] = {
+                            "packet": new_pkt, "slice": "full",
+                        }
+
+                # Untouched chunks in this batch → count as filler-skipped.
+                file_skipped += len(touched_this_batch)
+
+            # Stream chunks from the reader; batch and flush.
+            try:
+                async for chunk in documents_module.read_document(metadata, config):
+                    file_chunks += 1
+                    pages_seen.add(chunk.page_number)
+                    batch.append(chunk)
+                    if len(batch) >= batch_size:
+                        await _flush_batch(batch, total_batches + 1)
+                        batch = []
+                if batch:
+                    await _flush_batch(batch, total_batches + 1)
+                    batch = []
+            except documents_module.DocumentReadError as e:
+                err = f"[document read error: {e}]"
+                sys.stdout.write(err + "\n")
+                sys.stdout.flush()
+                collected_reply_parts.append(err)
+
+            total_pages += len(pages_seen)
+            total_chunks += file_chunks
+            total_new_packets += file_new_pkts
+            total_updated_packets += file_updated_pkts
+            total_skipped_chunks += file_skipped
+
+            per_file_line = (
+                f"\n{metadata.filename}: {len(pages_seen)} pages, "
+                f"{file_chunks} chunks → "
+                f"{file_new_pkts} new packet(s), {file_updated_pkts} updated, "
+                f"{file_skipped} chunks skipped as filler.\n"
+            )
+            sys.stdout.write(per_file_line)
+            sys.stdout.flush()
+            collected_reply_parts.append(per_file_line.strip())
+
+        summary_reply = (
+            f"Read {len(opened_files)} file(s): {', '.join(opened_files) or '(none)'}. "
+            f"{total_pages} pages, {total_chunks} chunks → "
+            f"{total_new_packets} new packet(s), {total_updated_packets} updated, "
+            f"{total_skipped_chunks} skipped."
+        )
+        if open_errors:
+            summary_reply += (
+                " Errors: "
+                + "; ".join(f"{p}: {e}" for p, e in open_errors)
+            )
+
+        final_reply = "\n".join(collected_reply_parts + [summary_reply])
+        session.add_turn("coco", final_reply)
+
+        tracing.update(span, output={
+            "opened_files": opened_files,
+            "open_errors": open_errors,
+            "total_pages": total_pages,
+            "total_chunks": total_chunks,
+            "total_batches": total_batches,
+            "new_packets": total_new_packets,
+            "updated_packets": total_updated_packets,
+            "skipped_chunks": total_skipped_chunks,
+        })
+        return final_reply
+
+
+async def _integrate_with_document_source(
+    packet: Packet,
+    new_content: str,
+    doc_source: PacketSource,
+    writer: Identity,
+    store: PacketStore,
+    config: dict,
+) -> bool:
+    """Merge document-sourced content into an existing packet.
+
+    Structurally identical to integrate_into_packet, but the PacketSource
+    appended on commit is a document-type source (not URL / conversation).
+    Trust and conflict resolution work the same way; the `source_trust` term
+    is the document's file_authoritativeness.
+    """
+    if not writer.can("integrate_packet"):
+        _capability_denied(writer, "integrate_packet")
+        return False
+
+    new_eff = float(doc_source.effective_authoritativeness or 0.0)
+    existing_auth = float(getattr(packet, "authoritativeness", 0.0) or 0.0)
+
+    facets_str = ", ".join(f'"{t.text}"' for t in packet.topics)
+    entities_str = ", ".join(packet.entities[:30])
+    combined_image_manifest = list(getattr(packet, "images", []) or [])
+    existing_urls = packet.source_urls() if hasattr(packet, "source_urls") else None
+
+    # Fabricate a display-only source label for the integrate prompt so the
+    # LLM can reference provenance in the merged text ("per handbook.pdf p14").
+    src_label = f"{doc_source.filename}#p{doc_source.page_number}"
+    if doc_source.paragraph_index is not None:
+        src_label += f".{doc_source.paragraph_index}"
+
+    prompt = render_integrate_prompt(
+        existing_facets=facets_str,
+        existing_entities=entities_str,
+        existing_content=packet.content.full or packet.content.summary or packet.content.gist,
+        existing_source_urls=existing_urls,
+        existing_authoritativeness=existing_auth,
+        new_content=new_content,
+        new_source_url=src_label,
+        new_authoritativeness=new_eff,
+        writer_role=writer.role,
+        image_manifest_items=combined_image_manifest,
+    )
+
+    raw = await _claude_call(
+        system_prompt="You are an expert at editing and integrating knowledge concisely.",
+        user_content=prompt,
+        model=config["anthropic_model"],
+        span_name="integrate_on_write",
+    )
+    try:
+        integrated = parse_integration_response(raw)
+    except Exception as e:
+        print(f"\n[integrate parse error: {e}]")
+        return False
+
+    trust_resolution = integrated.get("trust_resolution", "new_wins")
+    tracing.score(
+        name="trust_resolution", value=1,
+        comment=f"{trust_resolution} new={new_eff:.2f} existing={existing_auth:.2f}",
+    )
+
+    if trust_resolution == "equal_escalate" and integrated.get("conflict_detected"):
+        if not writer.can("override_conflict"):
+            tracing.score(
+                name="auto_skipped_conflict", value=1,
+                comment=f"role={writer.role}",
+            )
+            return False
+        desc = integrated.get("conflicting_excerpts") or "(no description)"
+        topic_name = packet.topics[0].text if packet.topics else packet.id
+        print(f"\n[Conflict in packet '{topic_name}']")
+        print(f"  Description: {desc}")
+        print(f"  Existing trust: {existing_auth:.2f}  |  New trust: {new_eff:.2f}")
+        print(f"  New info:    {new_content}")
+        choice = input("  Apply update? [y/N]: ").strip().lower()
+        if choice != "y":
+            print("  Skipped.")
+            return False
+
+    packet.content.gist = integrated.get("gist", packet.content.gist)
+    packet.content.summary = integrated.get("summary", packet.content.summary)
+    packet.content.full = integrated.get("full", packet.content.full)
+
+    new_facet_texts = integrated.get("topic_facets") or []
+    for t in new_facet_texts:
+        if not t or not t.strip():
+            continue
+        if any(t.strip().lower() == ex.text.strip().lower() for ex in packet.topics):
+            continue
+        v = embed(t, config["embedding_model"])
+        packet.add_facet_if_new(t, v, config["facet_dedup_threshold"])
+
+    packet.merge_entities(integrated.get("entities") or [])
+    packet.add_source(doc_source)
+    packet.record_event("write", config["strength_weights"]["write"])
+    store.save(packet)
+    ui.memory_updated(packet.content.gist or (packet.topics[0].text if packet.topics else ""))
+    tracing.score(
+        name="write", value=1,
+        comment=f"updated {packet.id} trust={packet.authoritativeness:.2f}",
+    )
+    tracing.score(
+        name="document_write", value=1,
+        comment=f"{src_label} → {packet.id} trust={packet.authoritativeness:.2f}",
+    )
+    return True
+
+
+async def _create_packet_from_document(
+    seed_topic: str,
+    seed_content: str,
+    seed_source: PacketSource,
+    writer: Identity,
+    store: PacketStore,
+    config: dict,
+    session_id: str,
+) -> Packet | None:
+    """Create a fresh packet from a document chunk.
+
+    Mirrors _create_packet_from_seed but attaches a document-type PacketSource
+    (not URL / conversation).
+    """
+    if not writer.can("create_packet"):
+        _capability_denied(writer, "create_packet")
+        return None
+
+    seed_eff = float(seed_source.effective_authoritativeness or 0.0)
+
+    prompt = render_new_packet_prompt(
+        seed_topic=seed_topic,
+        seed_content=seed_content,
+        seed_source_url=None,   # document sources render their own label below
+        seed_authoritativeness=seed_eff,
+        writer_role=writer.role,
+        image_manifest_items=None,
+    )
+    raw = await _claude_call(
+        system_prompt="You are an expert at extracting clean knowledge from raw conversation excerpts.",
+        user_content=prompt,
+        model=config["anthropic_model"],
+        span_name="new_packet_creation",
+    )
+    try:
+        d = parse_new_packet_response(raw)
+    except Exception as e:
+        print(f"\n[new-packet parse error: {e}]")
+        return None
+
+    facets_texts = d.get("topic_facets") or [seed_topic]
+    if not facets_texts:
+        facets_texts = [seed_topic]
+    facet_pairs = [(t, embed(t, config["embedding_model"])) for t in facets_texts]
+    entities = d.get("entities") or []
+
+    pkt = Packet.new(
+        topics=facet_pairs,
+        entities=entities,
+        gist=d.get("gist", ""),
+        summary=d.get("summary", ""),
+        full=d.get("full", seed_content),
+        sources=[seed_source],
+    )
+    pkt.source_session_ids.append(session_id)
+    pkt.record_event("write", config["strength_weights"]["write"])
+    store.add(pkt)
+    ui.memory_saved(pkt.content.gist or (pkt.topics[0].text if pkt.topics else ""))
+    tracing.score(
+        name="write", value=1,
+        comment=f"created {pkt.id} trust={pkt.authoritativeness:.2f}",
+    )
+    tracing.score(
+        name="document_write", value=1,
+        comment=(
+            f"{seed_source.filename}#p{seed_source.page_number}"
+            + (
+                f".{seed_source.paragraph_index}"
+                if seed_source.paragraph_index is not None else ""
+            )
+            + f" → {pkt.id} trust={pkt.authoritativeness:.2f}"
+        ),
+    )
+    return pkt
+
+
+# -----------------------------------------------------------------------------
 # chat_turn — reply only, no retrieval / topic resolution
 # -----------------------------------------------------------------------------
 
@@ -1059,12 +1544,17 @@ async def chat_turn(
     config: dict,
     session_n: int,
     ingest_intent: dict | None = None,
+    upload_intent: dict | None = None,
 ) -> str:
     _reset_denial_hints()
     with tracing.observation(
         "chat_turn",
         as_type="span",
-        input={"user_message": user_message, "ingest_intent": ingest_intent},
+        input={
+            "user_message": user_message,
+            "ingest_intent": ingest_intent,
+            "upload_intent": upload_intent,
+        },
         metadata={
             "session_id": session.id,
             "session_n": session_n,
@@ -1083,7 +1573,28 @@ async def chat_turn(
         if ingest_requested and not session.user.can("skill.fetch_url"):
             _capability_denied(session.user, "skill.fetch_url")
             ingest_requested = False
-        if ingest_requested:
+
+        upload_requested = (
+            config.get("ingest_doc_enabled", True)
+            and upload_intent
+            and upload_intent.get("is_upload_request")
+            and upload_intent.get("file_paths")
+        )
+        if upload_requested and not session.user.can("skill.upload_document"):
+            _capability_denied(session.user, "skill.upload_document")
+            upload_requested = False
+
+        if upload_requested:
+            reply = await _handle_document_upload(
+                user_message,
+                upload_intent["file_paths"],
+                session,
+                store,
+                scratchpad,
+                config,
+                session_n,
+            )
+        elif ingest_requested:
             reply = await _handle_ingest(
                 user_message,
                 ingest_intent["urls"],
@@ -1101,6 +1612,7 @@ async def chat_turn(
             "reply": reply,
             "loaded_packets": list(session.loaded_packets.keys()),
             "ingest": bool(ingest_intent and ingest_intent.get("is_ingest_request")),
+            "upload": bool(upload_intent and upload_intent.get("is_upload_request")),
         })
         return reply
 
@@ -1376,16 +1888,22 @@ async def run_session():
                 print(f"\n[submit-extraction error: {e}]")
 
             ingest_intent = None
+            upload_intent = None
             if submit_result is not None:
                 ingest_intent = {
                     "is_ingest_request": submit_result.get("is_ingest_request", False),
                     "urls": submit_result.get("urls", []),
+                }
+                upload_intent = {
+                    "is_upload_request": submit_result.get("is_upload_request", False),
+                    "file_paths": submit_result.get("file_paths", []),
                 }
 
             try:
                 await chat_turn(
                     event.text, session, store, scratchpad, config, session_n,
                     ingest_intent=ingest_intent,
+                    upload_intent=upload_intent,
                 )
             except Exception as e:
                 print(f"\n[turn error: {e}]")

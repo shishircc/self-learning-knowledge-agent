@@ -6,6 +6,7 @@ has-new-entities. Also flags URL ingest requests for `chat_turn` to dispatch.
 """
 import re
 
+from .documents import extract_file_paths
 from .embeddings import embed
 from .llm import anthropic_client
 from .prompts import EXTRACTION_PROMPT, parse_extraction_response
@@ -64,6 +65,8 @@ async def extract_partial(
             "topic_vec":         np.ndarray | None,
             "is_ingest_request": bool,
             "urls":              list[str],
+            "is_upload_request": bool,
+            "file_paths":        list[str],
             "reason":            str | None,
         }
     """
@@ -91,6 +94,7 @@ async def extract_partial(
         tracing.update(gen, output=raw)
 
     regex_urls = _dedupe_urls(_URL_RE.findall(partial_text))
+    regex_paths = extract_file_paths(partial_text)
 
     try:
         d = parse_extraction_response(raw)
@@ -104,6 +108,8 @@ async def extract_partial(
             "topic_vec": None,
             "is_ingest_request": False,
             "urls": regex_urls,
+            "is_upload_request": False,
+            "file_paths": regex_paths,
             "reason": f"parse_error: {e}",
         }
 
@@ -114,17 +120,23 @@ async def extract_partial(
     entities = [e.lower().strip() for e in (d.get("entities") or []) if e and e.strip()]
     reason = d.get("reason")
     is_ingest_request = bool(d.get("is_ingest_request", False))
+    is_upload_request = bool(d.get("is_upload_request", False))
     llm_urls = _dedupe_urls([u for u in (d.get("urls") or []) if isinstance(u, str)])
-    # Union of LLM-extracted and regex-extracted URLs — regex is the backstop.
+    # Union of LLM-extracted and regex-extracted URLs / paths — regex is the backstop.
     urls = _dedupe_urls(llm_urls + regex_urls)
+    llm_paths = [p for p in (d.get("file_paths") or []) if isinstance(p, str) and p.strip()]
+    file_paths = _dedupe_paths(llm_paths + regex_paths)
 
     # Ingest with no URLs is a small-LM bug — degrade to non-ingest.
     if is_ingest_request and not urls:
         is_ingest_request = False
+    # Upload with no file_paths is likewise degraded.
+    if is_upload_request and not file_paths:
+        is_upload_request = False
 
     should_retrieve = is_meaningful and (has_new_topic or has_new_entities)
-    # An ingest request should still trigger retrieval so related packets load.
-    if is_ingest_request:
+    # An ingest / upload request should still trigger retrieval so related packets load.
+    if is_ingest_request or is_upload_request:
         should_retrieve = True
 
     topic_vec = None
@@ -140,6 +152,8 @@ async def extract_partial(
         "topic_vec": topic_vec,
         "is_ingest_request": is_ingest_request,
         "urls": urls,
+        "is_upload_request": is_upload_request,
+        "file_paths": file_paths,
         "reason": reason,
     }
 
@@ -149,6 +163,18 @@ def _dedupe_urls(urls: list[str]) -> list[str]:
     out: list[str] = []
     for u in urls:
         s = (u or "").strip().rstrip(".,;:)\"'")
+        if not s or s.lower() in seen:
+            continue
+        seen.add(s.lower())
+        out.append(s)
+    return out
+
+
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in paths:
+        s = (p or "").strip().strip("\"'").rstrip(".,;:")
         if not s or s.lower() in seen:
             continue
         seen.add(s.lower())
