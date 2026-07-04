@@ -4,7 +4,7 @@ A conversational agent that learns from the conversations she has. Knowledge get
 
 This document is the source of truth for the conceptual design. Implementation choices (runtime, embedding model, libraries) are tracked separately.
 
-**v2 change vs v1:** packets now have *multiple* topic facets (each with its own vector) and a separate *entity list* — making memory multi-entry-point rather than single-handle. Retrieval becomes a three-channel RRF (topic BM25, topic max-cosine, entity BM25). Write path gains a "new facet vs new packet" decision. Coco can also **ingest URLs** as conversational content — the user says "read this" with a link and the fetched page flows through the normal write path, with content-bearing images embedded inline as base64. Coco also **uploads documents** (PDF, DOCX, PPTX) as a third source of knowledge — the file is read in streaming fashion, the LLM judges whether it's a word-processing or presentation-style document, and content is split paragraph-by-paragraph (or slide-by-slide) into chunks that each route through the normal write path. Coco also gains **identity-aware multi-user operation**: anonymous or SSO (Microsoft Entra / Google) login at startup; roles carry a *capability set* (binary access checks) and a scalar *authoritativeness* (trust); every packet records source provenance (URL, speaker, or uploaded file) so conflict resolution and retrieval ranking can prefer higher-trust knowledge. Coco now also runs a **strict grounded-reply policy**: substantive answers must come from the content of loaded packets — nothing else. Coco does not draw on her base-model world knowledge, does not guess, does not infer from general knowledge, does not "be helpful" by filling gaps. When a topic isn't covered by a loaded packet her reply is exactly: **"I do not know about this."** She may follow that with a brief offer to learn (the user can tell her, share a URL, or upload a file), but she does not attempt an answer. Coco is a memory-only assistant; base-model knowledge is not a permitted source of answers. v1 data is discarded (clean break).
+**v2 change vs v1:** packets now have *multiple* topic facets (each with its own vector) and a separate *entity list* — making memory multi-entry-point rather than single-handle. Retrieval becomes a three-channel RRF (topic BM25, topic max-cosine, entity BM25). Write path gains a "new facet vs new packet" decision. Coco can also **ingest URLs** as conversational content — the user says "read this" with a link and the fetched page flows through the normal write path, with content-bearing images embedded inline as base64. Coco also **uploads documents** (PDF, DOCX, PPTX) as a third source of knowledge — the file is read in streaming fashion, the LLM judges whether it's a word-processing or presentation-style document, and content is split paragraph-by-paragraph (or slide-by-slide) into chunks that each route through the normal write path. Coco also gains **identity-aware multi-user operation**: anonymous or SSO (Microsoft Entra / Google) login at startup; roles carry a *capability set* (binary access checks) and a scalar *authoritativeness* (trust); every packet records source provenance (URL, speaker, or uploaded file) so conflict resolution and retrieval ranking can prefer higher-trust knowledge. Coco now also runs a **packet-anchored reply policy**: every substantive answer must be *anchored* by at least one fact in a loaded packet. Base-model / general knowledge may only be used as **connective tissue** to reason from a packet fact toward a conclusion — never as the standalone source of an answer. When *no* loaded packet is even relevant to the question, Coco's reply is exactly: **"I do not know about this."** (optionally followed by one short line offering to learn). Coco is a memory-anchored assistant: the packet supplies the substrate; reasoning may extend it. v1 data is discarded (clean break).
 
 ---
 
@@ -140,12 +140,12 @@ ScratchpadEntry
      - increment retrieval_count on newly loaded packets
 
 3. Coco's main LLM call (single prompt, structured output):
-     - generates her reply, subject to the **grounded-reply policy**
-       (see "Grounded reply policy" below): the ONLY permitted sources
-       for a substantive answer are the loaded packets. If loaded
-       packets don't cover the user's question, the reply is exactly
-       "I do not know about this." — no guessing, no world knowledge,
-       no helpful inference.
+     - generates her reply, subject to the **packet-anchored reply policy**
+       (see "Grounded reply policy" below): every substantive answer must
+       be anchored by a fact from a loaded packet. General knowledge may
+       be used to reason FROM a packet fact toward a conclusion, but not
+       as the standalone source. If no loaded packet is relevant to the
+       question, the reply is exactly "I do not know about this."
      - generates current ≤10-word topic facet for this turn
      - declares which loaded packets she actually drew from
        → increments use_count on each
@@ -182,28 +182,58 @@ ScratchpadEntry
 
 ## Grounded reply policy
 
-Coco is a **memory-only** assistant. Every substantive answer she gives must be grounded in the content of packets currently loaded in the session. Base-model world knowledge is not a permitted source. Guessing is not permitted. "Reasonable inference from what most people know" is not permitted. If a loaded packet doesn't say it, Coco doesn't say it.
+Coco is a **memory-anchored** assistant. Every substantive answer she gives must be *anchored* by at least one fact in a loaded packet. General knowledge may be used as **connective tissue** to reason from a packet fact toward a conclusion — it may not be used as the standalone source of an answer. If no loaded packet is relevant to the question, Coco refuses with an exact phrase.
 
 **The rule, phrased tightly:**
 
-> Coco's reply may draw only on (a) the text of loaded packets, and (b) the small carve-out list below. If the user asks about anything else, Coco's reply is exactly: **"I do not know about this."**
+> A substantive reply must be *anchored* by at least one loaded-packet fact. Base-model / general knowledge is permitted only when it is used to *reason FROM* an anchored packet fact toward the answer. When no loaded packet is relevant to the question at all, Coco's reply is exactly: **"I do not know about this."**
 
 She may follow that refusal with one short, optional line offering a productive next step ("You can tell me and I'll remember, or share a URL/file and I'll read it."). She does not attempt to answer.
 
-### What "grounded" means
+### What "packet-anchored" means
 
-Grounded is not the same as verbatim. Coco may:
+The load-bearing test: **can Coco name the specific packet-fact her answer starts from?** If yes, the answer is anchored. If no — if the answer would be the same even without the packet — it's ungrounded, and she refuses.
+
+Coco may:
 
 - **Quote or paraphrase** any content from loaded packets.
-- **Synthesize across loaded packets** — if packet A says X and packet B says Y, she may combine them into "X, and separately Y."
-- **Reason within loaded content** — if a packet says "Alka lives in Delhi" and the user asks "does Alka live in Delhi?", she can affirm without quoting the exact sentence.
+- **Synthesize across loaded packets** — if packet A says X and packet B says Y, combine them.
+- **Reason within loaded content** — affirm implications a packet directly states.
+- **Reason FROM a packet fact using general knowledge as connective tissue** — combine a packet fact with common-knowledge premises to derive a further conclusion. Example: if a packet says "diamond is hard enough to cut glass" and the user asks "can diamond cut paper?", she may reason from the packet fact (diamond cuts glass) via the general premise (paper is softer than glass) to answer "yes, diamond can cut paper." The packet fact is the anchor; general knowledge bridges it to the answer.
 
-Grounded explicitly **excludes**:
+Coco must NOT:
 
-- **Base-model knowledge.** Even if Coco "knows" the capital of France from her pre-training, she does not say it unless a loaded packet contains it.
-- **General inference.** Even if a claim is obvious given world knowledge ("humans need to sleep"), she does not assert it without a packet.
-- **Helpful guessing.** Even if a plausible answer is high-confidence and low-risk, she does not offer it. Silence — the refusal phrase — is the correct response.
-- **Reasoning that pulls in external premises.** She may reason *within* loaded content, but she may not smuggle unstated facts through the reasoning step.
+- **Answer from base knowledge alone.** If there is no relevant loaded packet, no reasoning bridge saves the answer. Refuse.
+- **Smuggle an ungrounded claim through a reasoning step.** The reasoning must genuinely start from a loaded packet fact — not invoke a packet as a decorative preamble to a base-model answer.
+- **Guess or hedge.** "I'm not sure but maybe…" is not permitted. Either the packet anchors an answer (with reasoning if needed) or Coco refuses.
+- **Answer questions that share only a keyword with a packet.** A packet mentioning "Alka" doesn't authorize answers about arbitrary questions that happen to name Alka; the packet must actually contribute a fact that the reasoning uses.
+
+**Transparency when the reasoning is non-trivial.** When the answer comes from reasoning FROM a packet fact rather than directly stated, Coco should make the chain visible: "The packet says X. Given Y, it follows that Z." This makes the anchor auditable and lets the user correct her if the general-knowledge bridge is wrong.
+
+### Worked examples
+
+*(All assume the named packets are loaded in the session.)*
+
+- **Direct quote.**
+  Packet: `"Alka lives in Delhi."` Q: *"Where does Alka live?"* → A: "Alka lives in Delhi." (Anchored: quoted.)
+
+- **Synthesis across two packets.**
+  Packet A: `"Alka lives in Delhi."` Packet B: `"Shishir works in Bangalore."` Q: *"Where do Alka and Shishir live/work?"* → A: "Alka lives in Delhi and Shishir works in Bangalore." (Anchored: both packets.)
+
+- **Reasoning FROM a packet fact via general knowledge.**
+  Packet: `"Diamond is hard enough to cut glass."` Q: *"Can diamond cut paper?"* → A: "Yes — the packet notes diamond can cut glass. Paper is much softer than glass, so diamond can definitely cut paper." (Anchored: diamond-hardness fact. Bridge: paper vs glass hardness — general knowledge.)
+
+- **Partial-coverage split.**
+  Packet: `"Alka lives in Delhi."` Q: *"Does Alka like coffee?"* → A: "I know Alka lives in Delhi. I do not know about her coffee preferences." (Anchored on the covered part; refused on the uncovered part.)
+
+- **Ungrounded — no relevant packet.**
+  Loaded packets: (none about France or European geography.) Q: *"What's the capital of France?"* → A: "I do not know about this."
+
+- **Ungrounded — keyword collision doesn't count as anchor.**
+  Packet: `"Alka has a diamond ring."` Q: *"What's the chemical formula of diamond?"* → A: "I do not know about this." (The packet mentions the word "diamond" but contributes no fact that the answer would use — the ring is not the anchor for the chemical-formula question.)
+
+- **Reasoning that just decorates a base-model answer — not allowed.**
+  Packet: `"Alka lives in Delhi."` Q: *"What's the population of Delhi?"* → A: "I do not know about this." (Naming Delhi in the answer doesn't make the population fact grounded — the packet does not contribute anything the reasoning uses. The population claim would come entirely from base knowledge.)
 
 ### The exceptions carve-out
 
@@ -222,9 +252,9 @@ Anything not in this list is subject to the strict grounded-reply rule.
 
 Retrieval runs *before* the reply LLM (pre-retrieval on partials, refinement retrieval on submit). By the time Coco composes her reply, the session has already loaded whatever packets the 3-channel RRF surfaced above the retrieval threshold. So the answer to "did retrieval load anything?" is knowable at reply time.
 
-- If retrieval loaded packets that cover the user's question → Coco answers from them.
-- If retrieval loaded packets that are related but don't cover the specific angle → Coco says what the loaded content covers and refuses the uncovered part ("I know that Alka lives in Delhi, but I do not know about her coffee preferences.").
-- If retrieval loaded no packets on the user's topic → Coco refuses with the exact phrase.
+- If retrieval loaded a packet that anchors the answer (directly or via reasoning) → Coco answers, making the reasoning chain visible if it's non-trivial.
+- If retrieval loaded packets that are related but don't anchor the specific question → Coco names what IS covered and refuses the uncovered part.
+- If retrieval loaded no packets that can anchor the question → Coco refuses with the exact phrase.
 
 The refusal is **not a signal that retrieval failed** — sometimes there is genuinely no packet, and the honest answer is that Coco doesn't know. Retrieval tuning cannot make Coco know things she has never been taught.
 
@@ -736,7 +766,7 @@ A conversation about Alka's parents matches via the "Alka's family" facet — ev
 | Anonymous permitted | Anonymous role with authoritativeness 0.0; can be offered alongside SSO or used as the sole mode | Some installs want fully open conversational use; trust-weighted decisions still degrade anonymous contributions automatically |
 | Where identity lives | On `Session.user` + propagated to Langfuse trace metadata + recorded on every packet write as a `PacketSource` | Identity is session-scoped at runtime *and* attribution-scoped at the packet level — per-write provenance is now first-class, not deferred |
 | User name in the agent's context | On login, `Identity.name` (from SSO claims — display name for Entra / Google) is spliced into Coco's main-reply system prompt every turn; anonymous mode falls back to `"the user"` | Coco should know who she is talking to from turn 1 — greet by name, resolve self-referential packets (`entities: ["shishir"]`), avoid asking "and you are…?" the user just answered via SSO. Reads name from `Session.user.name`, not from a config string, so multi-user deployments work correctly |
-| Grounded-reply policy | Substantive answers may come **only** from loaded packet content. No base-model knowledge, no guessing, no helpful inference. When no loaded packet covers the topic, reply is exactly "I do not know about this." (optionally followed by one line offering to learn) | Coco's value is her accumulated memory, not general LLM competence. Base-model fallback destroys three things: (a) the user's ability to tell what Coco actually remembers, (b) the write-path pressure that drives self-learning, (c) the provenance guarantee that every claim is traceable to a `PacketSource`. Strict grounding makes Coco legible — every answer is either from her memory or the honest refusal, never a fourth option |
+| Grounded-reply policy | Substantive answers must be *anchored* by at least one loaded packet fact. General knowledge is permitted only as connective tissue to reason FROM a packet fact toward the answer — never as the standalone source. When no loaded packet is relevant to the question, reply is exactly "I do not know about this." (optionally followed by one line offering to learn) | Coco's value is her accumulated memory, not general LLM competence. Anchoring every answer in a packet gives the user (a) legibility about what Coco actually remembers, (b) preserved write-path pressure so unanswered questions become new packets, and (c) an auditable provenance chain — the packet is the substrate, general knowledge is only the bridge. Allowing packet-anchored reasoning keeps Coco genuinely helpful without collapsing into base-model chat |
 | Refusal phrase is fixed, not paraphrased | The exact string "I do not know about this." — not "I don't have that in memory", not "I'm not sure", not "let me look that up" | Consistency lets the user recognize the refusal instantly and reach for the "tell me / share URL / upload file" affordance. Variable phrasings drift toward hedging, which drifts toward guessing |
 | Grounded-reply exceptions carve-out | Small closed list: user identity (from login), Coco's self-description, conversational niceties, introspection over loaded state, ingest/upload turns, clarification questions | Zero exceptions makes Coco unusable (can't even say hi). A closed list keeps the carve-outs auditable and prevents drift toward "helpful world knowledge" |
 | Refusal turns still run the write path | Even when Coco refuses to answer, any substantive user content in the same turn flows through the scratchpad / packet-write path | Refusing to *answer* isn't the same as refusing to *learn*. Every unanswered question is an opportunity to add a packet so next time Coco can answer |
