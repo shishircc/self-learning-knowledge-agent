@@ -1834,7 +1834,9 @@ async def run_session(cli_flags=None):
     session_n = counter.increment()
     scratchpad.prune_old(session_n, config["scratchpad_discard_after_sessions"])
 
-    tracing_on = tracing.init()
+    # Pass config so `tracing.enabled=false` can short-circuit before we
+    # import langfuse or read LANGFUSE_* env vars. Config wins over env.
+    tracing_on = tracing.init(config)
 
     # Pre-load embedding model so the first extraction is not blocked on it.
     get_model(config["embedding_model"])

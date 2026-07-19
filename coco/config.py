@@ -57,6 +57,14 @@ DEFAULT_CONFIG = {
     "debug_print_state": False,
     "debug_print_streaming": False,
     "debug_print_write_path": False,
+    # ---- Observability ----
+    # Master switch for Langfuse tracing. When false, tracing.init(config)
+    # short-circuits before importing `langfuse` or reading LANGFUSE_* env vars,
+    # and every helper is a no-op. Config wins over env: setting this to false
+    # keeps tracing off even when credentials are present in the environment.
+    "tracing": {
+        "enabled": True,
+    },
     # ---- Identity / auth ----
     "auth": {
         "startup_mode": "prompt",

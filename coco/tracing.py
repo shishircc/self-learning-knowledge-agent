@@ -1,4 +1,11 @@
-"""Langfuse tracing wrapper. No-op when LANGFUSE_* env vars are absent."""
+"""Langfuse tracing wrapper.
+
+No-op when EITHER:
+  - config["tracing"]["enabled"] is false (config wins; env is not consulted), OR
+  - LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY are absent from the environment.
+
+See TDS.md §2.8 and §6.4 for the precedence rules and rationale.
+"""
 import os
 from contextlib import contextmanager
 
@@ -7,14 +14,39 @@ _enabled = False
 _initialized = False
 
 
-def init() -> bool:
-    """Idempotent. Reads LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST.
-    Returns True if tracing is active.
+def _config_gate(config) -> bool:
+    """Read config["tracing"]["enabled"] tolerantly.
+
+    Missing / malformed → default true (env-only gate as before).
+    Truthy non-bool → true; falsy non-bool → false.
+    """
+    if not isinstance(config, dict):
+        return True
+    section = config.get("tracing")
+    if not isinstance(section, dict):
+        return True
+    if "enabled" not in section:
+        return True
+    return bool(section["enabled"])
+
+
+def init(config=None) -> bool:
+    """Idempotent. Returns True if tracing is active.
+
+    Gate order:
+      1. config["tracing"]["enabled"] must be truthy (default true when absent).
+         When false: short-circuit before importing `langfuse` or reading env.
+      2. LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY must be present in env.
+      3. `langfuse.Langfuse(...)` must instantiate cleanly.
     """
     global _client, _enabled, _initialized
     if _initialized:
         return _enabled
     _initialized = True
+
+    if not _config_gate(config):
+        _enabled = False
+        return False
 
     public = os.environ.get("LANGFUSE_PUBLIC_KEY")
     secret = os.environ.get("LANGFUSE_SECRET_KEY")

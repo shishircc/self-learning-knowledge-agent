@@ -289,20 +289,27 @@ class Session:
 
 ### 2.8 `coco.tracing`
 
-**Purpose.** Thin wrapper around langfuse 4.x. No-op when `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` are not in env.
+**Purpose.** Thin wrapper around langfuse 4.x. No-op when either (a) `config["tracing"]["enabled"]` is `false`, or (b) `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` are not in env. Config wins over env: a deployment can be running with real Langfuse credentials in `.env` and still keep tracing off by setting `tracing.enabled=false`.
 
 **Public API:**
 | Symbol | Signature | Notes |
 |---|---|---|
-| `init()` | `() -> bool` | Idempotent; reads env, instantiates client; returns enabled flag |
-| `enabled()` | `() -> bool` | |
-| `observation(name, as_type, input, metadata, model)` | context manager → `LangfuseSpan \| None` | Wraps `start_as_current_observation` |
-| `session_context(session_id, user_id=None)` | context manager | Wraps `langfuse.propagate_attributes` |
-| `update(obs, **kwargs)` | | Safe `obs.update(...)` |
-| `score(name, value, comment=None)` | | `client.score_current_trace(...)` |
-| `flush()` | | Drain pending traces |
+| `init(config=None)` | `(dict \| None) -> bool` | Idempotent; consults `config["tracing"]["enabled"]` first (default `true` when absent) — if `false`, short-circuits without touching env, without importing `langfuse`, and returns `False`. Otherwise reads env, instantiates the client, and returns the enabled flag. `config=None` preserves the pre-config-gate behaviour (env-only) for tests. |
+| `enabled()` | `() -> bool` | Returns the resolved flag from the last `init(...)` call. |
+| `observation(name, as_type, input, metadata, model)` | context manager → `LangfuseSpan \| None` | Wraps `start_as_current_observation`. Yields `None` when tracing is disabled — every `coco.tracing`-consuming site is written to accept `None` gracefully (e.g. `with tracing.observation(...) as span: tracing.update(span, output=...)`), so the disabled path adds zero branching to callers. |
+| `session_context(session_id, user_id=None, metadata=None)` | context manager | Wraps `langfuse.propagate_attributes`. No-op when disabled. |
+| `update(obs, **kwargs)` | | Safe `obs.update(...)`; no-op when `obs is None`. |
+| `score(name, value, comment=None)` | | `client.score_current_trace(...)`; no-op when disabled. |
+| `flush()` | | Drain pending traces; no-op when disabled. |
 
-**Depends on:** `langfuse` (lazy import inside `init`).
+**Config-gate precedence.**
+1. If `config["tracing"]["enabled"] is False` → `init(config)` returns `False` immediately. Neither `LANGFUSE_PUBLIC_KEY` nor `LANGFUSE_SECRET_KEY` are read; `langfuse` is not imported. This is the intended path for deployments that need to run Coco fully offline (air-gapped, personal, latency-sensitive) even when credentials happen to be present in the environment.
+2. Else if the env credentials are missing → `init(config)` returns `False` (unchanged behaviour — the "no keys, no tracing" case).
+3. Else → `init(config)` instantiates the Langfuse client and returns `True`.
+
+**Why config-gate wins over env.** Env credentials are commonly ambient: a shared `.env`, a CI secret, an inherited shell. A developer iterating on a prompt should be able to disable tracing for one session with a single config flip, without having to unset environment variables. Making config authoritative also lets a production config pin `tracing.enabled=false` even in an environment that provides Langfuse keys for other tools.
+
+**Depends on:** `langfuse` (lazy import inside `init`, and only when the config gate permits).
 
 ### 2.9 `coco.agent`
 
@@ -324,7 +331,7 @@ class Session:
 | `_create_packet_from_seed(seed_topic, seed_content, store, config, session_id, writer, source_url=None, initial_images=None)` | async → `Packet \| None` | LLM-driven packet creation from scratchpad seed. `writer: Identity` is the current session user — required so the new packet's first `PacketSource` carries the writer's role + role authoritativeness. `source_url` is set when called from `_handle_ingest`; resolves a URL-type `PacketSource` (with `domain_authoritativeness = auth.resolve_domain_authoritativeness(source_url, config)`), otherwise a conversation-type `PacketSource`. The packet's initial `authoritativeness` is `source.effective_authoritativeness`. `initial_images: list[PacketImage]` is set during ingest; each image is appended to `packet.images` after creation. |
 | `integrate_into_packet(packet, new_content, store, config, writer, source_url=None, new_images=None)` | async → `bool` | LLM merge with **trust-driven** conflict resolution. `writer: Identity` is the current session user. The function (1) computes `new_eff = effective_authoritativeness(writer.role_authoritativeness, resolve_domain_authoritativeness(source_url) if source_url else None)`; (2) passes both `packet.authoritativeness` (existing) and `new_eff` (incoming) into the integrate prompt; the LLM uses them to resolve conflicting facts in favor of the higher-trust source. On commit: a new `PacketSource` is appended via `packet.add_source(...)` (URL-type when `source_url` is set, conversation-type otherwise), which also lifts `packet.authoritativeness` if `new_eff` is greater. The interactive y/N prompt only fires when the LLM reports a conflict at *equal* trust **AND** `writer.can("override_conflict")`; otherwise the LLM's trust-based merge is final. `new_images: list[PacketImage]` is appended to `packet.images` before the integrate-LLM call so the prompt can see the full alt-text manifest. The integrate LLM never sees image bytes — it only manipulates `coco-img:<id>` references in markdown. |
 | `on_text_event(text, session, store, scratchpad, config)` | async → `None` | Single handler called for **both** partial and submit events. Runs `extraction.extract_partial`, then (if meaningful) `resolve_topic` + `_retrieve_packets`. This is the ONLY retrieval and topic-classification path in the system. Ingest-detection lives here too (the extractor sets `is_ingest_request`), but the fetch itself is deferred to `chat_turn`. |
-| `run_session(cli_flags=None)` | async → `None` | Drives the streaming loop: `async for event in streaming.input_stream(...)`. For `partial`, spawns `on_text_event` as a background task (fire-and-track). For `submit`: awaits any in-flight partial tasks, runs `on_text_event` synchronously on the complete text, captures `ingest_intent` from that final extraction, THEN calls `chat_turn(..., ingest_intent=...)`. `cli_flags` is the `argparse.Namespace` parsed by `__main__` (or `None` in tests); it is threaded straight through to `auth.acquire_identity(config, cli_flags=cli_flags)` so the local-admin short-circuit (§5.12) fires before any other startup work. **Before opening the input stream**, calls `auth.acquire_identity(config, cli_flags=cli_flags)` and constructs `Session(user=identity)`. When `session.admin_mode` is true, `ui.banner_admin_warning()` is printed before the welcome banner and every prompt/reply carries the admin visual badge. The acquired `identity` is also passed to `tracing.session_context(session.id, user_id=identity.email or identity.name, metadata={"role": identity.role, "role_authoritativeness": identity.role_authoritativeness, "provider": identity.provider, "admin_mode": session.admin_mode})`. |
+| `run_session(cli_flags=None)` | async → `None` | Drives the streaming loop: `async for event in streaming.input_stream(...)`. For `partial`, spawns `on_text_event` as a background task (fire-and-track). For `submit`: awaits any in-flight partial tasks, runs `on_text_event` synchronously on the complete text, captures `ingest_intent` from that final extraction, THEN calls `chat_turn(..., ingest_intent=...)`. `cli_flags` is the `argparse.Namespace` parsed by `__main__` (or `None` in tests); it is threaded straight through to `auth.acquire_identity(config, cli_flags=cli_flags)` so the local-admin short-circuit (§5.12) fires before any other startup work. **Before opening the input stream**, calls `auth.acquire_identity(config, cli_flags=cli_flags)` and constructs `Session(user=identity)`. Calls `tracing.init(config)` — passing the loaded config so the `tracing.enabled` gate is honoured before `langfuse` is imported or env credentials are read. When `session.admin_mode` is true, `ui.banner_admin_warning()` is printed before the welcome banner and every prompt/reply carries the admin visual badge. The acquired `identity` is also passed to `tracing.session_context(session.id, user_id=identity.email or identity.name, metadata={"role": identity.role, "role_authoritativeness": identity.role_authoritativeness, "provider": identity.provider, "admin_mode": session.admin_mode})` (no-op when tracing is disabled). |
 
 **Depends on:** every other `coco.*` module; `anthropic` (direct SDK, via `coco.llm`); `coco.fetch`; `coco.auth`.
 
@@ -792,6 +799,7 @@ All knobs read from `config.json` (defaults in `coco.config.DEFAULT_CONFIG`). Ca
 | Document upload | `ingest_doc_enabled` (default `true`), `ingest_doc_allowed_formats` (default `["pdf","docx","pptx","txt","md"]`), `ingest_doc_max_file_bytes` (default `25_000_000`), `ingest_doc_max_pages` (default `500` — hard cap; beyond this `read_document` truncates with a notice), `ingest_doc_classifier_sample_pages` (default `3` — number of PDF pages fed to the document-type classifier), `ingest_doc_min_paragraph_chars` (default `120`), `ingest_doc_max_paragraph_chars` (default `1500`), `ingest_doc_batch_chunks` (default `10` — chunks per write-path LLM call), `ingest_doc_progress_interval_pages` (default `5` — emit a streamed progress hint every N pages) |
 | Image loading | `image_blocks_max_per_turn` (default `20` — total `image` content blocks attached to any single user message; over this, lowest-strength packets shed images first) |
 | Developer mode | `debug_print_state` (default `false`), `debug_print_streaming` (default `false`), `debug_print_write_path` (default `false`) — see §5.6. End-user UX (§5.5) is the default. |
+| Observability | `tracing.enabled` (default `true`) — master switch for Langfuse tracing. When `false`, `tracing.init(config)` short-circuits without touching `LANGFUSE_*` env vars or importing `langfuse`, and every `observation` / `session_context` / `score` / `update` / `flush` call is a no-op. Precedence: config `false` wins over env credentials (a `.env` with keys does *not* re-enable tracing). Env credentials still gate the `true` path — missing keys degrade to no-op the same way §2.8 always described. |
 | Models | `embedding_model`, `anthropic_model`, `small_lm_model` (default `claude-haiku-4-5`) |
 | Storage | `data_dir` |
 | Authentication | `auth.startup_mode` (`"prompt"` \| `"anonymous"` \| `"authenticated"`; default `"prompt"`), `auth.providers` (ordered subset of `["anonymous","entra","google"]`), `auth.default_provider` (used when `startup_mode=="authenticated"`), `auth.default_role` (default `"user"`), `auth.fallback_to_anonymous` (default `true`), `auth.allow_cli_admin` (default `false` — when `true`, the `--admin` CLI flag synthesizes a full-trust admin identity without SSO; MUST stay `false` in production configs), `auth.entra.tenant_id` / `client_id` / `scopes` / `flow` (`"device_code"` \| `"browser_pkce"`), `auth.google.client_id` / `scopes` / `redirect_uri`, `auth.email_role_map` (`{email -> role}`, case-insensitive), `auth.entra_group_role_map` (`{group_object_id -> role}`), `auth.role_capabilities` (`{role -> list[capability]}`; omitted roles inherit `DEFAULT_ROLE_CAPABILITIES`) |
@@ -1602,7 +1610,12 @@ This separation makes the UI show *where* memory activity happened across the li
 
 ### 6.4 Offline mode
 
-When `LANGFUSE_*` env vars are absent, every helper returns immediately and contributes zero overhead. The session and traces simply don't exist.
+Tracing is off — and every `coco.tracing` helper returns immediately with zero overhead — whenever *either* gate closes:
+
+- **Config gate.** `config["tracing"]["enabled"] == false`. Checked first, wins over env. Suppresses the `langfuse` import entirely so the module is not paid for at process start. This is the intended path for air-gapped, personal, or latency-sensitive deployments where env credentials might still be present but should not be used.
+- **Env gate.** `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` absent (or the client fails to initialise). Same effect: `init()` returns `False`, downstream helpers are no-ops. This is the default for developer machines without credentials.
+
+Either way the session and traces simply don't exist. Every consumer site — `observation` / `session_context` / `score` / `update` / `flush` — is written so the disabled path adds zero branching in call-sites. `_capability_denied` scores, retrieval scores, and identity metadata are all silently dropped.
 
 ---
 
@@ -2068,7 +2081,8 @@ sequenceDiagram
     Run->>SC: increment()
     SC-->>Run: session_n
     Run->>SP: prune_old(session_n, max_inactive)
-    Run->>TR: init()
+    Run->>TR: init(config)
+    Note over TR: config["tracing"]["enabled"]==false → short-circuit;<br/>else consult LANGFUSE_* env credentials
     TR-->>Run: tracing_on?
     Run->>TR: session_context(session.id, user_id=identity.email or identity.name,<br/>metadata={role, role_authoritativeness, provider})
     Run->>Run: preload SentenceTransformer via get_model
@@ -2471,6 +2485,10 @@ sequenceDiagram
 | `claude-agent-sdk` raises | Bubbles up to `run_session`'s top-level `try/except`, prints `[turn error: ...]`, continues loop |
 | Embedding model first download fails | Hard fail — Coco cannot operate without embeddings |
 | `langfuse` init exception | Caught; tracing disabled; rest of system proceeds |
+| `config["tracing"]["enabled"] == false` | `tracing.init(config)` short-circuits before importing `langfuse` or reading env; `enabled()` returns `False` for the life of the process; every helper is a no-op. No warning printed — this is the intended offline mode, not a failure. |
+| `config["tracing"]["enabled"] == false` with `LANGFUSE_*` env vars set | Config wins. Env credentials are ignored; no client is instantiated; no traces are sent. Deliberate: config is authoritative so a shared env cannot re-enable tracing behind the operator's back. |
+| `config["tracing"]` missing / not a dict | Treated as `{"enabled": true}` — the default. Tracing then falls through to the env-credentials gate as before. |
+| `config["tracing"]["enabled"]` value is not a bool | Coerced via `bool(...)`; truthy non-bools enable, falsy non-bools disable. No startup error. |
 | Disk write error (packet save) | Bubbles up; turn fails with `[turn error: ...]` |
 | Streaming extraction LLM parse error | Logged at debug level; partial event skipped; no retrieval mutation; next `partial` will retry |
 | Streaming extraction timeout | Cancelled; partial event skipped; next `partial` proceeds |
@@ -2583,6 +2601,7 @@ sequenceDiagram
 |---|---|
 | Swap embedding model | `config.embedding_model`; `embeddings.get_model` already caches |
 | Add a new tracing backend | Replace `tracing.py` with same context-manager interface |
+| Disable observability entirely | Set `tracing.enabled=false` in `config.json`. `tracing.init(config)` short-circuits before importing `langfuse`; every helper is a no-op for the process. Env credentials are ignored (config wins). Use for air-gapped installs, latency-sensitive runs, or when a shared `.env` provides Langfuse keys the current deployment must not use. |
 | Replace RRF with weighted-sum or rerank | `retrieval.rrf_packet_search` + `config.hybrid_search_method` (currently only RRF wired) |
 | Add image-embedding retrieval channel | Extend `Packet` schema with `image_vectors`; add Channel D in `rrf_packet_search`; update prompts |
 | Per-facet strength | Move `strength_events` from `Packet` onto `TopicFacet`; update `compute_strength` callsites; update slice selection to pick per-facet |
