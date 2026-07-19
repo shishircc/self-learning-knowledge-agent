@@ -26,8 +26,13 @@
   "debug_print_state": true,
   "debug_print_streaming": true,
 
+  "tracing": {
+    "enabled": false
+  },
+
   "auth": {
     "startup_mode": "prompt",
+    "allow_cli_admin": true,
     "providers": ["anonymous", "entra", "google"],
     "default_role": "user",
     "fallback_to_anonymous": true,
