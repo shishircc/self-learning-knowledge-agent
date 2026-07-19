@@ -19,6 +19,16 @@ class Session:
         self.loaded_packets: dict[str, dict] = {}  # packet_id -> {packet, slice}
         self.turns: list[dict] = []  # {role: "user"|"coco", content: str}
 
+    @property
+    def admin_mode(self) -> bool:
+        """True iff the session was started with the --admin CLI flag.
+
+        Derived from `user.provider` (not stored) so the visual mode cannot
+        drift from the acquired identity. Read by run_session and the UI
+        helpers that paint the admin banner and per-turn badge.
+        """
+        return self.user.provider == "cli_admin"
+
     def add_turn(self, role: str, content: str):
         self.turns.append({"role": role, "content": content})
 

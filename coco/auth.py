@@ -99,7 +99,7 @@ class Identity:
     role: str
     role_authoritativeness: float
     capabilities: frozenset[str]
-    provider: str  # "anonymous" | "entra" | "google"
+    provider: str  # "anonymous" | "entra" | "google" | "cli_admin"
     claims: dict = field(default_factory=dict)
 
     def can(self, capability: str) -> bool:
@@ -115,13 +115,24 @@ class Identity:
 
     def trace_metadata(self) -> dict:
         # Safe-for-trace projection; never includes raw claims (PII risk).
-        return {
+        md = {
             "name": self.name,
             "email": self.email,
             "role": self.role,
             "role_authoritativeness": self.role_authoritativeness,
             "provider": self.provider,
         }
+        # Local admin mode marker — surfaced so post-hoc Langfuse review can
+        # filter unauthenticated dev sessions out of real-user traffic.
+        if self.provider == "cli_admin":
+            md["admin_mode"] = True
+            md["unauthenticated"] = True
+        return md
+
+    @property
+    def is_local_admin(self) -> bool:
+        """True iff this identity was synthesized by the --admin CLI flag."""
+        return self.provider == "cli_admin"
 
 
 def _anonymous_capabilities(config: dict | None) -> frozenset[str]:
@@ -146,6 +157,45 @@ def make_anonymous(config: dict | None = None) -> Identity:
 
 
 ANONYMOUS: Identity = make_anonymous(None)
+
+
+# ---------------------------------------------------------------------------
+# Local admin mode (--admin CLI flag)
+# ---------------------------------------------------------------------------
+#
+# Developer escape hatch that bypasses SSO on startup. Concept, safety gates,
+# and visual-signalling requirements live in DESIGN.md §"Local admin mode".
+# This factory synthesizes a full-trust admin identity WITHOUT touching an
+# IdP. Callers (only `acquire_identity`) must have already verified
+# `config.auth.allow_cli_admin` — this function itself does not check it.
+
+LOCAL_ADMIN_DEFAULT_NAME = "local-admin"
+
+
+def local_admin_identity(config: dict, admin_name: str | None = None) -> Identity:
+    """Synthesize the full-trust admin identity used by --admin mode.
+
+    `name`     = admin_name or "local-admin"
+    `email`    = None (no IdP round-trip)
+    `role`     = "admin", role_authoritativeness = 1.0
+    `provider` = "cli_admin"  — the marker that flags this session as
+                                unauthenticated in Langfuse metadata and
+                                (indirectly, via email=None) in per-write
+                                PacketSource provenance.
+
+    Capabilities come from the normal `resolve_capabilities("admin", config)`
+    path so operator-configured tightening of the admin role still applies.
+    """
+    name = (admin_name or "").strip() or LOCAL_ADMIN_DEFAULT_NAME
+    return Identity(
+        name=name,
+        email=None,
+        role="admin",
+        role_authoritativeness=ROLE_AUTHORITATIVENESS["admin"],
+        capabilities=resolve_capabilities("admin", config),
+        provider="cli_admin",
+        claims={},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -354,15 +404,32 @@ def resolve_file_authoritativeness(filename: str | None, config: dict) -> float:
 # Identity acquisition at startup
 # ---------------------------------------------------------------------------
 
-async def acquire_identity(config: dict) -> Identity:
+async def acquire_identity(config: dict, cli_flags=None) -> Identity:
     """Drive the configured startup flow; always returns an Identity.
 
-    Modes:
+    `cli_flags` is the parsed argparse.Namespace from __main__ (or None in
+    tests). When `cli_flags.admin` is truthy, the local-admin short-circuit
+    fires BEFORE any other startup work:
+      - config.auth.allow_cli_admin must be true, otherwise AuthError.
+      - Returns local_admin_identity(config, cli_flags.admin_name) — no IdP,
+        no prompt, no fallback.
+
+    Modes (only reached when --admin is NOT set):
       "anonymous"     -> ANONYMOUS immediately.
       "authenticated" -> drive `default_provider` directly.
       "prompt"        -> interactive choice between the configured providers.
     """
     cfg = (config.get("auth") or {})
+
+    # --- Local admin short-circuit ------------------------------------------
+    if cli_flags is not None and getattr(cli_flags, "admin", False):
+        if not bool(cfg.get("allow_cli_admin", False)):
+            raise AuthError(
+                "--admin is disabled in this config; "
+                "set auth.allow_cli_admin=true in a local config to use it"
+            )
+        return local_admin_identity(config, getattr(cli_flags, "admin_name", None))
+
     mode = cfg.get("startup_mode", "prompt")
     providers = list(cfg.get("providers") or [])
     fallback = bool(cfg.get("fallback_to_anonymous", True))

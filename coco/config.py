@@ -78,6 +78,11 @@ DEFAULT_CONFIG = {
         "email_role_map": {},
         "entra_group_role_map": {},
         "role_capabilities": {},  # empty => DEFAULT_ROLE_CAPABILITIES used per role
+        # Developer escape hatch: when true, the `--admin` CLI flag synthesizes
+        # a full-trust admin identity without SSO. MUST stay False in production
+        # configs — admin capabilities should be reachable only through a real
+        # IdP-resolved admin role. See DESIGN.md §"Local admin mode".
+        "allow_cli_admin": False,
     },
     # ---- Source trust ----
     "domain_authoritativeness": {},

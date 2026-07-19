@@ -86,11 +86,12 @@ class _PartialDispatcher:
             self.debounce_task = self.loop.create_task(self._debounce_fire(text))
 
 
-async def _fallback_input_stream(config: dict):
+async def _fallback_input_stream(config: dict, admin_mode: bool = False):
     """Blocking input — no partial events."""
+    label = "[ADMIN] You: " if admin_mode else "You: "
     while True:
         try:
-            text = await asyncio.to_thread(input, "You: ")
+            text = await asyncio.to_thread(input, label)
         except (EOFError, KeyboardInterrupt):
             yield StreamEvent("cancel", "")
             return
@@ -102,10 +103,14 @@ async def _fallback_input_stream(config: dict):
             yield StreamEvent("submit", text)
 
 
-async def input_stream(config: dict):
-    """Async generator over StreamEvents from the user's typing."""
+async def input_stream(config: dict, admin_mode: bool = False):
+    """Async generator over StreamEvents from the user's typing.
+
+    `admin_mode` (when true) tells the UI to render a bold red [ADMIN] badge
+    on every prompt so the user cannot type without seeing the mode.
+    """
     if not HAVE_PT or not sys.stdin.isatty():
-        async for ev in _fallback_input_stream(config):
+        async for ev in _fallback_input_stream(config, admin_mode=admin_mode):
             yield ev
         return
 
@@ -126,7 +131,9 @@ async def input_stream(config: dict):
         async def read_submit():
             try:
                 with patch_stdout(raw=True):
-                    text = await session.prompt_async(HTML(ui.user_prompt_html()))
+                    text = await session.prompt_async(
+                        HTML(ui.user_prompt_html(admin_mode=admin_mode))
+                    )
                 if text.strip().lower() in ("exit", "quit"):
                     await queue.put(StreamEvent("cancel", ""))
                 else:

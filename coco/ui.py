@@ -46,15 +46,57 @@ def banner_welcome(user_name: str) -> None:
     _styled("")
 
 
-def banner_goodbye() -> None:
+def banner_admin_warning() -> None:
+    """Unmissable warning block for local admin (--admin) mode.
+
+    Rendered at session start before banner_welcome. Communicates three things
+    the user must not lose sight of:
+      1. The session is UNAUTHENTICATED.
+      2. Every mutation runs with full admin trust.
+      3. This mode must not be used in production.
+    """
+    box_top = "╔══════════════════════════════════════════════════════════════════╗"
+    box_bot = "╚══════════════════════════════════════════════════════════════════╝"
+    lines = [
+        "║  ⚠  LOCAL ADMIN MODE — UNAUTHENTICATED                           ║",
+        "║     Full admin capabilities, no SSO.                             ║",
+        "║     Unadvisable outside local development.                       ║",
+        "║     Every mutation runs with admin trust.                        ║",
+        "║     Do NOT use in production.                                    ║",
+    ]
+    _styled("")
+    _styled(f"<b><ansired>{box_top}</ansired></b>")
+    for ln in lines:
+        _styled(f"<b><ansired>{ln}</ansired></b>")
+    _styled(f"<b><ansired>{box_bot}</ansired></b>")
+    _styled("")
+
+
+def banner_goodbye(admin_mode: bool = False) -> None:
     _styled("")
     _styled("<ansicyan>Goodbye. Talk soon.</ansicyan>")
+    if admin_mode:
+        _styled(
+            "<i><ansired>local admin mode — session was unauthenticated</ansired></i>"
+        )
     _styled("")
 
 
-def coco_label() -> None:
-    """Print 'Coco:' label (no newline) before the streamed reply."""
-    _styled("\n<b><ansicyan>Coco:</ansicyan></b> ", end="")
+def coco_label(admin_mode: bool = False) -> None:
+    """Print 'Coco:' label (no newline) before the streamed reply.
+
+    In admin mode, appends a dim red `(admin mode)` marker on the same line
+    so the badge survives long conversations where the startup banner has
+    scrolled off.
+    """
+    if admin_mode:
+        _styled(
+            "\n<b><ansicyan>Coco:</ansicyan></b>"
+            " <i><ansired>(admin mode)</ansired></i> ",
+            end="",
+        )
+    else:
+        _styled("\n<b><ansicyan>Coco:</ansicyan></b> ", end="")
 
 
 def hint(text: str) -> None:
@@ -62,8 +104,14 @@ def hint(text: str) -> None:
     _styled(f"<i><ansibrightblack>{text}</ansibrightblack></i>")
 
 
-def user_prompt_html() -> str:
-    """HTML string to pass as the prompt label to PromptSession.prompt_async."""
+def user_prompt_html(admin_mode: bool = False) -> str:
+    """HTML string to pass as the prompt label to PromptSession.prompt_async.
+
+    In admin mode, prepends a bold red [ADMIN] badge so the user cannot type a
+    message without seeing the mode on the same line as their input.
+    """
+    if admin_mode:
+        return "<b><ansired>[ADMIN]</ansired></b> <b><ansigreen>You:</ansigreen></b> "
     return "<b><ansigreen>You:</ansigreen></b> "
 
 
