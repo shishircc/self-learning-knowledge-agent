@@ -57,6 +57,14 @@ DEFAULT_CONFIG = {
     "debug_print_state": False,
     "debug_print_streaming": False,
     "debug_print_write_path": False,
+    # ---- Observability ----
+    # Master switch for Langfuse tracing. When false, tracing.init(config)
+    # short-circuits before importing `langfuse` or reading LANGFUSE_* env vars,
+    # and every helper is a no-op. Config wins over env: setting this to false
+    # keeps tracing off even when credentials are present in the environment.
+    "tracing": {
+        "enabled": True,
+    },
     # ---- Identity / auth ----
     "auth": {
         "startup_mode": "prompt",
@@ -78,6 +86,11 @@ DEFAULT_CONFIG = {
         "email_role_map": {},
         "entra_group_role_map": {},
         "role_capabilities": {},  # empty => DEFAULT_ROLE_CAPABILITIES used per role
+        # Developer escape hatch: when true, the `--admin` CLI flag synthesizes
+        # a full-trust admin identity without SSO. MUST stay False in production
+        # configs — admin capabilities should be reachable only through a real
+        # IdP-resolved admin role. See DESIGN.md §"Local admin mode".
+        "allow_cli_admin": False,
     },
     # ---- Source trust ----
     "domain_authoritativeness": {},

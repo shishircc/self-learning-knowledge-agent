@@ -67,13 +67,14 @@ Each module's public surface and its dependencies on other modules.
 |---|---|---|
 | `Identity` | dataclass | `{name: str, email: str \| None, role: str, role_authoritativeness: float, capabilities: frozenset[str], provider: str, claims: dict}` |
 | `ANONYMOUS` | `Identity` | `name="anonymous"`, `email=None`, `role="anonymous"`, `role_authoritativeness=0.0`, `capabilities=resolve_capabilities("anonymous", config)`, `provider="anonymous"`, `claims={}` |
+| `local_admin_identity(config, admin_name=None)` | sync → `Identity` | Synthesize the full-trust `admin` identity used by `--admin` mode. `name = admin_name or "local-admin"`, `email=None`, `role="admin"`, `role_authoritativeness=1.0`, `capabilities=resolve_capabilities("admin", config)`, `provider="cli_admin"`, `claims={}`. Never touches an IdP. Callers (only `acquire_identity`, when `cli_flags.admin` is set AND config permits) do the `auth.allow_cli_admin` check first. |
 | `ROLE_AUTHORITATIVENESS` | `dict[str, float]` | `{"admin": 1.0, "author": 0.8, "viewer": 0.5, "user": 0.3, "anonymous": 0.0}`. Maps role string → trust scalar. Surfaced for `resolve_role` consumers. |
 | `resolve_domain_authoritativeness(url, config)` | sync → `float` | Longest-prefix match of `url`'s host + path against `config["domain_authoritativeness"]` (keys are domain or `domain/path-prefix`). Falls back to `config["default_domain_authoritativeness"]` (default `0.5`). Case-insensitive host match; path match is exact-prefix (no glob). Returns `0.0` only when the config explicitly maps the pattern to `0.0`. |
 | `resolve_file_authoritativeness(filename, config)` | sync → `float` | Longest-match of `filename` (and absolute path, if available) against `config["file_authoritativeness"]` keys. Keys can be filename globs (`*.draft.pdf`, `acme-handbook-*.pdf`) and/or path prefixes (`/policies/`). Path prefixes match a normalized absolute path; globs match the basename. Longest match wins; ties are broken by path-prefix > glob. Falls back to `config["default_file_authoritativeness"]` (default `0.5`). |
 | `effective_authoritativeness(role_auth, source_trust)` | sync → `float` | Returns `max(role_auth, source_trust or 0.0)`. Canonical computation used by `_create_packet_from_seed`, `integrate_into_packet`, and the document write-path. `source_trust` is whichever applies: `domain_authoritativeness` for URLs, `file_authoritativeness` for documents, `None`/`0` for plain conversation. |
 | `CAPABILITIES` | `frozenset[str]` | Known capability strings — see table below. Unknown capabilities found in config warn at startup and are ignored. |
 | `DEFAULT_ROLE_CAPABILITIES` | `dict[str, frozenset[str]]` | Hard-coded fallback applied when `config.auth.role_capabilities` is absent or missing an entry for a role. Matches the table in DESIGN.md §"Identity & roles". |
-| `acquire_identity(config)` | async → `Identity` | Top-level startup entry. Reads `config["auth"]` and drives the flow described below. Always returns a valid `Identity` (worst case `ANONYMOUS`). |
+| `acquire_identity(config, cli_flags=None)` | async → `Identity` | Top-level startup entry. Reads `config["auth"]` and drives the flow described below. `cli_flags` is the parsed `argparse.Namespace` from `__main__` (or `None` in tests). When `cli_flags.admin` is truthy AND `config["auth"]["allow_cli_admin"]` is truthy → returns `local_admin_identity(config, cli_flags.admin_name)` immediately (no SSO, no prompt). When `cli_flags.admin` is truthy but the config disallows it → raises `AuthError("cli_admin_disallowed")`. Otherwise falls through to the normal flow below. Always returns a valid `Identity` in non-admin paths (worst case `ANONYMOUS`). |
 | `login_entra(provider_cfg)` | async → `Identity` | Runs the configured Entra flow (`device_code` or `browser_pkce`) using `msal`. Reads `name` from `name` claim, `email` from `preferred_username` / `email`, role from `roles` claim or group lookup. |
 | `login_google(provider_cfg)` | async → `Identity` | Runs the Google OAuth2 + PKCE flow over a loopback redirect URI. Reads `name` from `name` claim, `email` from `email` claim. Role is resolved from `auth.email_role_map`. |
 | `resolve_role(email, claims, provider, config)` | sync → `(role: str, power: float)` | Provider-aware resolver. Entra: try claims first, fall back to email map; non-Entra: email map only. Unknown role strings warn and degrade to `auth.default_role`. |
@@ -100,6 +101,7 @@ Each module's public surface and its dependencies on other modules.
 | `skill.<id>` | Future skills. Each skill registers its capability id (string) and the agent's skill-invocation site checks `session.user.can("skill.<id>")` before calling. |
 
 **`acquire_identity` flow:**
+0. **Local admin short-circuit.** If `cli_flags is not None and cli_flags.admin` → check `config["auth"]["allow_cli_admin"]` (default `false`). If disallowed, raise `AuthError("cli_admin_disallowed")` — `__main__` prints the startup-error line and exits. If allowed, return `local_admin_identity(config, cli_flags.admin_name)` immediately. No IdP call, no prompt, no fallback. The mode selection below is skipped entirely.
 1. `mode = config["auth"]["startup_mode"]` (`"prompt"` \| `"anonymous"` \| `"authenticated"`).
 2. If `mode == "anonymous"` → return `ANONYMOUS` (capabilities populated via `resolve_capabilities("anonymous", config)`).
 3. If `mode == "authenticated"` → drive `config["auth"]["default_provider"]` directly.
@@ -269,9 +271,10 @@ class Session:
 | Symbol | Notes |
 |---|---|
 | `banner_welcome(user_name)` | Cyan-rule banner at session start |
-| `banner_goodbye()` | Closing line at session end |
-| `coco_label()` | Prints `Coco: ` in bold cyan (no newline) before the streamed reply |
-| `user_prompt_html()` | Returns the HTML string passed to `PromptSession.prompt_async` so `You: ` renders in bold green |
+| `banner_admin_warning()` | Prints the bordered red/yellow **LOCAL ADMIN MODE — UNAUTHENTICATED** warning block described in §5.12 / DESIGN.md §"Local admin mode". Called by `run_session` immediately before `banner_welcome` when `session.admin_mode` is true. On non-TTY stdout renders as plain ASCII with identical wording. |
+| `banner_goodbye(admin_mode=False)` | Closing line at session end. When `admin_mode=True`, appends a compact dim-red `local admin mode — session was unauthenticated` reminder so the user leaves aware of the mode they just ran in. |
+| `coco_label(admin_mode=False)` | Prints `Coco: ` in bold cyan (no newline) before the streamed reply. When `admin_mode=True`, appends a dim red ` (admin mode)` suffix on the same line so every reply carries the badge even after the startup banner has scrolled off. |
+| `user_prompt_html(admin_mode=False)` | Returns the HTML string passed to `PromptSession.prompt_async` so `You: ` renders in bold green. When `admin_mode=True`, prepends a bold red `[ADMIN] ` badge — the user cannot type a message without seeing the mode on the same line. |
 | `hint(text)` | Dim italic line, used (only when developer mode is on) to surface a brief status string |
 | `memory_recall(gist)` | Dim italic `recalling: <gist>` line — printed by `_retrieve_packets` whenever a packet is loaded into the session |
 | `memory_saved(gist)` | Dim italic `remembered: <gist>` line — printed by `_create_packet_from_seed` after a new packet is committed |
@@ -286,20 +289,27 @@ class Session:
 
 ### 2.8 `coco.tracing`
 
-**Purpose.** Thin wrapper around langfuse 4.x. No-op when `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` are not in env.
+**Purpose.** Thin wrapper around langfuse 4.x. No-op when either (a) `config["tracing"]["enabled"]` is `false`, or (b) `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` are not in env. Config wins over env: a deployment can be running with real Langfuse credentials in `.env` and still keep tracing off by setting `tracing.enabled=false`.
 
 **Public API:**
 | Symbol | Signature | Notes |
 |---|---|---|
-| `init()` | `() -> bool` | Idempotent; reads env, instantiates client; returns enabled flag |
-| `enabled()` | `() -> bool` | |
-| `observation(name, as_type, input, metadata, model)` | context manager → `LangfuseSpan \| None` | Wraps `start_as_current_observation` |
-| `session_context(session_id, user_id=None)` | context manager | Wraps `langfuse.propagate_attributes` |
-| `update(obs, **kwargs)` | | Safe `obs.update(...)` |
-| `score(name, value, comment=None)` | | `client.score_current_trace(...)` |
-| `flush()` | | Drain pending traces |
+| `init(config=None)` | `(dict \| None) -> bool` | Idempotent; consults `config["tracing"]["enabled"]` first (default `true` when absent) — if `false`, short-circuits without touching env, without importing `langfuse`, and returns `False`. Otherwise reads env, instantiates the client, and returns the enabled flag. `config=None` preserves the pre-config-gate behaviour (env-only) for tests. |
+| `enabled()` | `() -> bool` | Returns the resolved flag from the last `init(...)` call. |
+| `observation(name, as_type, input, metadata, model)` | context manager → `LangfuseSpan \| None` | Wraps `start_as_current_observation`. Yields `None` when tracing is disabled — every `coco.tracing`-consuming site is written to accept `None` gracefully (e.g. `with tracing.observation(...) as span: tracing.update(span, output=...)`), so the disabled path adds zero branching to callers. |
+| `session_context(session_id, user_id=None, metadata=None)` | context manager | Wraps `langfuse.propagate_attributes`. No-op when disabled. |
+| `update(obs, **kwargs)` | | Safe `obs.update(...)`; no-op when `obs is None`. |
+| `score(name, value, comment=None)` | | `client.score_current_trace(...)`; no-op when disabled. |
+| `flush()` | | Drain pending traces; no-op when disabled. |
 
-**Depends on:** `langfuse` (lazy import inside `init`).
+**Config-gate precedence.**
+1. If `config["tracing"]["enabled"] is False` → `init(config)` returns `False` immediately. Neither `LANGFUSE_PUBLIC_KEY` nor `LANGFUSE_SECRET_KEY` are read; `langfuse` is not imported. This is the intended path for deployments that need to run Coco fully offline (air-gapped, personal, latency-sensitive) even when credentials happen to be present in the environment.
+2. Else if the env credentials are missing → `init(config)` returns `False` (unchanged behaviour — the "no keys, no tracing" case).
+3. Else → `init(config)` instantiates the Langfuse client and returns `True`.
+
+**Why config-gate wins over env.** Env credentials are commonly ambient: a shared `.env`, a CI secret, an inherited shell. A developer iterating on a prompt should be able to disable tracing for one session with a single config flip, without having to unset environment variables. Making config authoritative also lets a production config pin `tracing.enabled=false` even in an environment that provides Langfuse keys for other tools.
+
+**Depends on:** `langfuse` (lazy import inside `init`, and only when the config gate permits).
 
 ### 2.9 `coco.agent`
 
@@ -321,7 +331,7 @@ class Session:
 | `_create_packet_from_seed(seed_topic, seed_content, store, config, session_id, writer, source_url=None, initial_images=None)` | async → `Packet \| None` | LLM-driven packet creation from scratchpad seed. `writer: Identity` is the current session user — required so the new packet's first `PacketSource` carries the writer's role + role authoritativeness. `source_url` is set when called from `_handle_ingest`; resolves a URL-type `PacketSource` (with `domain_authoritativeness = auth.resolve_domain_authoritativeness(source_url, config)`), otherwise a conversation-type `PacketSource`. The packet's initial `authoritativeness` is `source.effective_authoritativeness`. `initial_images: list[PacketImage]` is set during ingest; each image is appended to `packet.images` after creation. |
 | `integrate_into_packet(packet, new_content, store, config, writer, source_url=None, new_images=None)` | async → `bool` | LLM merge with **trust-driven** conflict resolution. `writer: Identity` is the current session user. The function (1) computes `new_eff = effective_authoritativeness(writer.role_authoritativeness, resolve_domain_authoritativeness(source_url) if source_url else None)`; (2) passes both `packet.authoritativeness` (existing) and `new_eff` (incoming) into the integrate prompt; the LLM uses them to resolve conflicting facts in favor of the higher-trust source. On commit: a new `PacketSource` is appended via `packet.add_source(...)` (URL-type when `source_url` is set, conversation-type otherwise), which also lifts `packet.authoritativeness` if `new_eff` is greater. The interactive y/N prompt only fires when the LLM reports a conflict at *equal* trust **AND** `writer.can("override_conflict")`; otherwise the LLM's trust-based merge is final. `new_images: list[PacketImage]` is appended to `packet.images` before the integrate-LLM call so the prompt can see the full alt-text manifest. The integrate LLM never sees image bytes — it only manipulates `coco-img:<id>` references in markdown. |
 | `on_text_event(text, session, store, scratchpad, config)` | async → `None` | Single handler called for **both** partial and submit events. Runs `extraction.extract_partial`, then (if meaningful) `resolve_topic` + `_retrieve_packets`. This is the ONLY retrieval and topic-classification path in the system. Ingest-detection lives here too (the extractor sets `is_ingest_request`), but the fetch itself is deferred to `chat_turn`. |
-| `run_session()` | async → `None` | Drives the streaming loop: `async for event in streaming.input_stream(...)`. For `partial`, spawns `on_text_event` as a background task (fire-and-track). For `submit`: awaits any in-flight partial tasks, runs `on_text_event` synchronously on the complete text, captures `ingest_intent` from that final extraction, THEN calls `chat_turn(..., ingest_intent=...)`. **Before opening the input stream**, calls `auth.acquire_identity(config)` and constructs `Session(user=identity)`. The acquired `identity` is also passed to `tracing.session_context(session.id, user_id=identity.email or identity.name, metadata={"role": identity.role, "role_authoritativeness": identity.role_authoritativeness, "provider": identity.provider})`. |
+| `run_session(cli_flags=None)` | async → `None` | Drives the streaming loop: `async for event in streaming.input_stream(...)`. For `partial`, spawns `on_text_event` as a background task (fire-and-track). For `submit`: awaits any in-flight partial tasks, runs `on_text_event` synchronously on the complete text, captures `ingest_intent` from that final extraction, THEN calls `chat_turn(..., ingest_intent=...)`. `cli_flags` is the `argparse.Namespace` parsed by `__main__` (or `None` in tests); it is threaded straight through to `auth.acquire_identity(config, cli_flags=cli_flags)` so the local-admin short-circuit (§5.12) fires before any other startup work. **Before opening the input stream**, calls `auth.acquire_identity(config, cli_flags=cli_flags)` and constructs `Session(user=identity)`. Calls `tracing.init(config)` — passing the loaded config so the `tracing.enabled` gate is honoured before `langfuse` is imported or env credentials are read. When `session.admin_mode` is true, `ui.banner_admin_warning()` is printed before the welcome banner and every prompt/reply carries the admin visual badge. The acquired `identity` is also passed to `tracing.session_context(session.id, user_id=identity.email or identity.name, metadata={"role": identity.role, "role_authoritativeness": identity.role_authoritativeness, "provider": identity.provider, "admin_mode": session.admin_mode})` (no-op when tracing is disabled). |
 
 **Depends on:** every other `coco.*` module; `anthropic` (direct SDK, via `coco.llm`); `coco.fetch`; `coco.auth`.
 
@@ -547,12 +557,35 @@ class DocumentError(Exception):
 ### 2.13 `coco.__main__`
 
 ```python
+import argparse
 from dotenv import load_dotenv
 load_dotenv()
-asyncio.run(run_session())
+
+parser = argparse.ArgumentParser(prog="coco")
+parser.add_argument(
+    "--admin",
+    action="store_true",
+    help="Start in local admin mode (bypasses SSO). Gated by "
+         "config.auth.allow_cli_admin — refuses otherwise. Developer "
+         "escape hatch for local iteration; must never be enabled in "
+         "production configs.",
+)
+parser.add_argument(
+    "--admin-name",
+    default=None,
+    help="Optional display name for the synthetic admin identity "
+         "(defaults to 'local-admin'). Ignored unless --admin is set.",
+)
+cli_flags = parser.parse_args()
+
+asyncio.run(run_session(cli_flags=cli_flags))
 ```
 
-Loads env *before* anything imports `tracing.init()`.
+Loads env *before* anything imports `tracing.init()`. Parses CLI flags once; passes the resulting `argparse.Namespace` into `run_session`, which threads `cli_flags.admin` and `cli_flags.admin_name` into `auth.acquire_identity` (§2.1a) and `Session.admin_mode` (§3.3). No other CLI flags exist today — future flags follow the same pattern.
+
+**Rejection paths.**
+- `--admin` passed but `config["auth"]["allow_cli_admin"]` is falsy → `auth.acquire_identity` raises `AuthError("cli_admin_disallowed")` which `__main__` catches, prints `[startup error: --admin is disabled in this config; set auth.allow_cli_admin=true in a local config to use it]`, and exits non-zero. The turn loop never starts.
+- `--admin-name` passed *without* `--admin` → warning printed, ignored. Not treated as a fatal error; normal (non-admin) startup proceeds.
 
 ## 3. Data structures
 
@@ -687,6 +720,8 @@ Session:
   turns:              list[{"role": "user"|"coco", "content": str}]
 ```
 
+**`admin_mode`** — derived property on `Session`, not stored: `return self.user.provider == "cli_admin"`. Read by `run_session` (chooses `banner_admin_warning` + admin-flavored `banner_goodbye`), by `ui.user_prompt_html(admin_mode=session.admin_mode)` at every prompt render, and by `ui.coco_label(admin_mode=session.admin_mode)` at every reply. Derivation from `Identity.provider` (rather than a stored boolean) ensures the visual mode cannot drift from the acquired identity.
+
 **Lifetime:** one process run of the CLI. Discarded at exit.
 
 ### 3.4 Identity (`auth.Identity`)
@@ -700,11 +735,14 @@ Identity:
   capabilities: frozenset[str]                           # resolved at construction from
                                                           # config.auth.role_capabilities;
                                                           # see auth.CAPABILITIES catalogue
-  provider:     "entra" | "google" | "anonymous"         # extensible: future providers list themselves here
+  provider:     "entra" | "google" | "anonymous" | "cli_admin"   # extensible
+                                                          # "cli_admin" is set only by the
+                                                          # --admin CLI flag path (§5.12);
+                                                          # gated by config.auth.allow_cli_admin
   claims:       dict                                     # raw provider claims (Entra only); empty for others
 ```
 
-**Acquired once** at startup by `auth.acquire_identity(config)` and carried on `Session.user` for the life of the process. Immutable after construction — re-authentication requires restarting Coco.
+**Acquired once** at startup by `auth.acquire_identity(config, cli_flags=...)` and carried on `Session.user` for the life of the process. Immutable after construction — re-authentication requires restarting Coco. The `provider="cli_admin"` variant is synthesized by `auth.local_admin_identity(config, admin_name)` when the developer passes `--admin` on the command line AND the config permits it (see §5.12).
 
 **Role power table** (`auth.ROLE_AUTHORITATIVENESS`):
 | role | power | intent |
@@ -761,9 +799,10 @@ All knobs read from `config.json` (defaults in `coco.config.DEFAULT_CONFIG`). Ca
 | Document upload | `ingest_doc_enabled` (default `true`), `ingest_doc_allowed_formats` (default `["pdf","docx","pptx","txt","md"]`), `ingest_doc_max_file_bytes` (default `25_000_000`), `ingest_doc_max_pages` (default `500` — hard cap; beyond this `read_document` truncates with a notice), `ingest_doc_classifier_sample_pages` (default `3` — number of PDF pages fed to the document-type classifier), `ingest_doc_min_paragraph_chars` (default `120`), `ingest_doc_max_paragraph_chars` (default `1500`), `ingest_doc_batch_chunks` (default `10` — chunks per write-path LLM call), `ingest_doc_progress_interval_pages` (default `5` — emit a streamed progress hint every N pages) |
 | Image loading | `image_blocks_max_per_turn` (default `20` — total `image` content blocks attached to any single user message; over this, lowest-strength packets shed images first) |
 | Developer mode | `debug_print_state` (default `false`), `debug_print_streaming` (default `false`), `debug_print_write_path` (default `false`) — see §5.6. End-user UX (§5.5) is the default. |
+| Observability | `tracing.enabled` (default `true`) — master switch for Langfuse tracing. When `false`, `tracing.init(config)` short-circuits without touching `LANGFUSE_*` env vars or importing `langfuse`, and every `observation` / `session_context` / `score` / `update` / `flush` call is a no-op. Precedence: config `false` wins over env credentials (a `.env` with keys does *not* re-enable tracing). Env credentials still gate the `true` path — missing keys degrade to no-op the same way §2.8 always described. |
 | Models | `embedding_model`, `anthropic_model`, `small_lm_model` (default `claude-haiku-4-5`) |
 | Storage | `data_dir` |
-| Authentication | `auth.startup_mode` (`"prompt"` \| `"anonymous"` \| `"authenticated"`; default `"prompt"`), `auth.providers` (ordered subset of `["anonymous","entra","google"]`), `auth.default_provider` (used when `startup_mode=="authenticated"`), `auth.default_role` (default `"user"`), `auth.fallback_to_anonymous` (default `true`), `auth.entra.tenant_id` / `client_id` / `scopes` / `flow` (`"device_code"` \| `"browser_pkce"`), `auth.google.client_id` / `scopes` / `redirect_uri`, `auth.email_role_map` (`{email -> role}`, case-insensitive), `auth.entra_group_role_map` (`{group_object_id -> role}`), `auth.role_capabilities` (`{role -> list[capability]}`; omitted roles inherit `DEFAULT_ROLE_CAPABILITIES`) |
+| Authentication | `auth.startup_mode` (`"prompt"` \| `"anonymous"` \| `"authenticated"`; default `"prompt"`), `auth.providers` (ordered subset of `["anonymous","entra","google"]`), `auth.default_provider` (used when `startup_mode=="authenticated"`), `auth.default_role` (default `"user"`), `auth.fallback_to_anonymous` (default `true`), `auth.allow_cli_admin` (default `false` — when `true`, the `--admin` CLI flag synthesizes a full-trust admin identity without SSO; MUST stay `false` in production configs), `auth.entra.tenant_id` / `client_id` / `scopes` / `flow` (`"device_code"` \| `"browser_pkce"`), `auth.google.client_id` / `scopes` / `redirect_uri`, `auth.email_role_map` (`{email -> role}`, case-insensitive), `auth.entra_group_role_map` (`{group_object_id -> role}`), `auth.role_capabilities` (`{role -> list[capability]}`; omitted roles inherit `DEFAULT_ROLE_CAPABILITIES`) |
 | Source trust | `domain_authoritativeness` (`{domain or domain/path-prefix -> float in [0,1]}`; longest-prefix match), `default_domain_authoritativeness` (default `0.5`; used when no pattern matches), `file_authoritativeness` (`{filename-glob or path-prefix -> float in [0,1]}`; longest-match wins; path-prefix beats glob on tie), `default_file_authoritativeness` (default `0.5`), `authoritativeness_bias_scale` (default `0.001`; scale of `h(authoritativeness)` added to RRF final score) |
 
 **Example `auth` block** (matches §2.1a `acquire_identity` exactly):
@@ -776,6 +815,13 @@ All knobs read from `config.json` (defaults in `coco.config.DEFAULT_CONFIG`). Ca
     "default_provider": "entra",
     "default_role": "user",
     "fallback_to_anonymous": true,
+    "allow_cli_admin": false,
+    // ^ set to `true` ONLY in local development configs.
+    //   When true, `python -m coco --admin` bypasses SSO and
+    //   drops the session into a synthetic full-trust admin
+    //   identity (provider="cli_admin"). Never enable this in
+    //   production — admin capabilities must be reachable only
+    //   through a real IdP-resolved admin role. See §5.12.
     "entra": {
       "tenant_id": "<tenant-guid>",
       "client_id": "<app-guid>",
@@ -1468,6 +1514,58 @@ The LLM may also emit chunks with `"skip": true` (filler) — those don't produc
 
 8. **Truncation at the page cap.** Documents over `ingest_doc_max_pages` stop yielding at the cap. The final summary mentions the truncation; an explicit re-run can extend the cap.
 
+### 5.12 Local admin mode
+
+Developer escape hatch that bypasses SSO on startup. Concept and rationale are in DESIGN.md §"Local admin mode (developer / testing only)"; this section pins the implementation surface.
+
+**Activation (three gates, all required):**
+
+1. **CLI flag.** `python -m coco --admin` — no default, no env-var fallback. Parsed by `__main__` via `argparse` (§2.13).
+2. **Config permission.** `config["auth"]["allow_cli_admin"]` must be truthy. Default is `false`. Production configs never flip this on.
+3. **Explicit intent per run.** The flag is per-invocation only. There is no `startup_mode="admin"`, no `default_provider="cli_admin"`. The user has to type `--admin` every time.
+
+If (1) is present without (2), `auth.acquire_identity` raises `AuthError("cli_admin_disallowed")`; `__main__` prints `[startup error: --admin is disabled in this config; set auth.allow_cli_admin=true in a local config to use it]` and exits non-zero. The turn loop never starts.
+
+**Identity construction.**
+
+```python
+def local_admin_identity(config: dict, admin_name: str | None = None) -> Identity:
+    return Identity(
+        name=admin_name or "local-admin",
+        email=None,
+        role="admin",
+        role_authoritativeness=ROLE_AUTHORITATIVENESS["admin"],   # 1.0
+        capabilities=resolve_capabilities("admin", config),        # full admin caps
+        provider="cli_admin",
+        claims={},
+    )
+```
+
+The result is indistinguishable from a real SSO-acquired admin in every downstream check (`Identity.can(...)`, retrieval bias via `role_authoritativeness`, `_create_packet_from_seed` / `integrate_into_packet` writer identity) *except* for `provider="cli_admin"`, which is the honest audit-trail marker.
+
+**Turn-loop wiring.**
+
+- `run_session(cli_flags=None)` receives the parsed `argparse.Namespace`.
+- Before opening `input_stream`, it calls `identity = await auth.acquire_identity(config, cli_flags=cli_flags)`. When the admin short-circuit fires, `identity.provider == "cli_admin"`.
+- `session = Session(user=identity)`. `session.admin_mode` (derived, §3.3) is now `True`.
+- Startup order:
+  1. `ui.banner_admin_warning()` — printed only when `session.admin_mode`; renders the red/yellow bordered warning block from DESIGN.md.
+  2. `ui.banner_welcome(identity.name)` — normal welcome banner, printed for every mode.
+- Every subsequent turn:
+  - `ui.user_prompt_html(admin_mode=session.admin_mode)` prepends the bold red `[ADMIN]` badge to the `You:` label.
+  - `ui.coco_label(admin_mode=session.admin_mode)` appends the dim red ` (admin mode)` suffix to the `Coco:` label.
+- Session end: `ui.banner_goodbye(admin_mode=session.admin_mode)` appends a compact `local admin mode — session was unauthenticated` reminder.
+
+**Trace metadata.** `tracing.session_context(session.id, user_id=identity.name, metadata=identity.trace_metadata())`. When `provider == "cli_admin"`, `Identity.trace_metadata()` includes `admin_mode=True, unauthenticated=True, provider="cli_admin"`. Post-hoc Langfuse review can filter on `admin_mode=True` to isolate unauthenticated dev sessions from real-user traffic.
+
+**Provenance on writes.** Every `PacketSource` a `--admin` session creates carries `speaker_name=identity.name` (e.g. `"local-admin"`), `speaker_email=None`, `speaker_role="admin"`, `role_authoritativeness=1.0`. `PacketSource` currently does not store `provider` directly, but a future field addition would let deployments filter out `provider="cli_admin"` sources during audits. Today the marker is on the session's Langfuse trace metadata; the packet-level provenance carries `email=None` as an indirect signal.
+
+**Interaction with capability gates (§5.9).** None. `--admin` populates `Identity.capabilities` via the normal `resolve_capabilities("admin", config)` path. Every gated call site (`_retrieve_packets`, `_create_packet_from_seed`, `integrate_into_packet`, `override_conflict`, `skill.fetch_url`, `skill.upload_document`, future `delete_packet` / `force_rewrite`) passes because the admin role owns the capability set. No special-case code paths exist for admin mode — the gates are role-based, and this role happens to be `admin`.
+
+**Interaction with production auth.** Zero. In production, `auth.allow_cli_admin=false` closes the CLI path, so admin capabilities are reachable only through SSO that resolves the current user to `role=="admin"` via Entra claims or the Google email→role map (see §7.11). A production deployment can additionally omit the flag from any wrapper script / systemd unit / container ENTRYPOINT; the config gate is the load-bearing defence, the wrapper omission is defence-in-depth.
+
+**What admin mode does not turn off.** Trust math, retrieval, conflict resolution, Langfuse tracing, packet-anchored reply policy — all still run exactly as they do for any other admin user. `--admin` is *only* an authentication shortcut with a loud visual marker. The rest of Coco doesn't know or care that the identity was synthesized locally.
+
 ---
 
 ## 6. Cross-cutting: tracing
@@ -1512,7 +1610,12 @@ This separation makes the UI show *where* memory activity happened across the li
 
 ### 6.4 Offline mode
 
-When `LANGFUSE_*` env vars are absent, every helper returns immediately and contributes zero overhead. The session and traces simply don't exist.
+Tracing is off — and every `coco.tracing` helper returns immediately with zero overhead — whenever *either* gate closes:
+
+- **Config gate.** `config["tracing"]["enabled"] == false`. Checked first, wins over env. Suppresses the `langfuse` import entirely so the module is not paid for at process start. This is the intended path for air-gapped, personal, or latency-sensitive deployments where env credentials might still be present but should not be used.
+- **Env gate.** `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` absent (or the client fails to initialise). Same effect: `init()` returns `False`, downstream helpers are no-ops. This is the default for developer machines without credentials.
+
+Either way the session and traces simply don't exist. Every consumer site — `observation` / `session_context` / `score` / `update` / `flush` — is written so the disabled path adds zero branching in call-sites. `_capability_denied` scores, retrieval scores, and identity metadata are all silently dropped.
 
 ---
 
@@ -1966,24 +2069,29 @@ sequenceDiagram
     actor U as User
 
     Main->>DOT: load_dotenv()
-    Main->>Run: asyncio.run(run_session())
+    Main->>Main: argparse: --admin, --admin-name
+    Main->>Run: asyncio.run(run_session(cli_flags))
     Run->>CFG: load_config()
     CFG-->>Run: config
-    Run->>Run: identity = await auth.acquire_identity(config)
-    Note over Run: anonymous or SSO (Entra / Google)<br/>see 7.11 for the auth subflow
+    Run->>Run: identity = await auth.acquire_identity(config, cli_flags=cli_flags)
+    Note over Run: --admin (config permits) → cli_admin identity;<br/>otherwise anonymous or SSO (Entra / Google).<br/>See 7.11 for the auth subflow.
     Run->>ST: PacketStore(data_dir)
     Run->>SP: Scratchpad(data_dir)
     Run->>SC: SessionCounter(data_dir)
     Run->>SC: increment()
     SC-->>Run: session_n
     Run->>SP: prune_old(session_n, max_inactive)
-    Run->>TR: init()
+    Run->>TR: init(config)
+    Note over TR: config["tracing"]["enabled"]==false → short-circuit;<br/>else consult LANGFUSE_* env credentials
     TR-->>Run: tracing_on?
     Run->>TR: session_context(session.id, user_id=identity.email or identity.name,<br/>metadata={role, role_authoritativeness, provider})
     Run->>Run: preload SentenceTransformer via get_model
     Note over Run: blocks until weights are loaded<br/>first extract_partial pays no load cost
     Run->>Sess: Session(user=identity)
-    Run-->>U: print banner (with identity.name)
+    alt session.admin_mode  (identity.provider == "cli_admin")
+        Run-->>U: ui.banner_admin_warning()  (red/yellow LOCAL ADMIN MODE block)
+    end
+    Run-->>U: ui.banner_welcome(identity.name)
 
     Run->>STR: async with input_stream(config) as stream
     activate STR
@@ -2112,10 +2220,19 @@ sequenceDiagram
     participant IDP as IdP (Entra or Google)
     participant CFG as config.auth
 
-    Run->>A: acquire_identity(config)
-    A->>CFG: read startup_mode, providers, default_provider, default_role
+    Run->>A: acquire_identity(config, cli_flags)
+    A->>CFG: read allow_cli_admin, startup_mode, providers, default_provider, default_role
 
-    alt startup_mode == "anonymous" OR providers empty OR providers == ["anonymous"]
+    alt cli_flags.admin  (developer passed --admin)
+        alt config.auth.allow_cli_admin == true
+            A->>A: local_admin_identity(config, cli_flags.admin_name)
+            Note over A: name="local-admin" (or override), role=admin,<br/>role_authoritativeness=1.0, provider="cli_admin",<br/>capabilities=resolve_capabilities("admin", config).<br/>No IdP call, no prompt.
+            A-->>Run: Identity(provider="cli_admin")
+        else config disallows
+            A-->>Run: raise AuthError("cli_admin_disallowed")
+            Note over Run: __main__ prints [startup error] and exits non-zero
+        end
+    else startup_mode == "anonymous" OR providers empty OR providers == ["anonymous"]
         A-->>Run: ANONYMOUS  (role_authoritativeness 0.0)
     else startup_mode == "authenticated"
         A->>A: choice = default_provider
@@ -2368,6 +2485,10 @@ sequenceDiagram
 | `claude-agent-sdk` raises | Bubbles up to `run_session`'s top-level `try/except`, prints `[turn error: ...]`, continues loop |
 | Embedding model first download fails | Hard fail — Coco cannot operate without embeddings |
 | `langfuse` init exception | Caught; tracing disabled; rest of system proceeds |
+| `config["tracing"]["enabled"] == false` | `tracing.init(config)` short-circuits before importing `langfuse` or reading env; `enabled()` returns `False` for the life of the process; every helper is a no-op. No warning printed — this is the intended offline mode, not a failure. |
+| `config["tracing"]["enabled"] == false` with `LANGFUSE_*` env vars set | Config wins. Env credentials are ignored; no client is instantiated; no traces are sent. Deliberate: config is authoritative so a shared env cannot re-enable tracing behind the operator's back. |
+| `config["tracing"]` missing / not a dict | Treated as `{"enabled": true}` — the default. Tracing then falls through to the env-credentials gate as before. |
+| `config["tracing"]["enabled"]` value is not a bool | Coerced via `bool(...)`; truthy non-bools enable, falsy non-bools disable. No startup error. |
 | Disk write error (packet save) | Bubbles up; turn fails with `[turn error: ...]` |
 | Streaming extraction LLM parse error | Logged at debug level; partial event skipped; no retrieval mutation; next `partial` will retry |
 | Streaming extraction timeout | Cancelled; partial event skipped; next `partial` proceeds |
@@ -2411,6 +2532,9 @@ sequenceDiagram
 | Auth: `msal` / `authlib` import fails | Provider unusable; `acquire_identity` removes it from the live `providers` list with a warning, then proceeds with the remaining options (or `ANONYMOUS` if none remain). |
 | Auth: Langfuse tracing disabled | `auth` span becomes a no-op; identity acquisition still runs and identity propagates to `Session.user`. |
 | Auth: unknown capability string in `config.auth.role_capabilities` | Warn at startup; drop the unknown capability from the resolved set; continue. Protects against config typos blocking the deployment when a capability is renamed. |
+| Auth: `--admin` passed but `auth.allow_cli_admin` is `false` (or absent) | `auth.acquire_identity` raises `AuthError("cli_admin_disallowed")`. `__main__` prints `[startup error: --admin is disabled in this config; set auth.allow_cli_admin=true in a local config to use it]` and exits non-zero. The turn loop never starts. Deliberately loud so a production deployment that leaked the flag into a wrapper script fails fast rather than silently downgrading to a real auth mode. |
+| Auth: `--admin-name` passed without `--admin` | Warning printed to stderr (`--admin-name has no effect without --admin`); normal (non-admin) startup proceeds. Not fatal. |
+| Auth: `--admin` passed AND config permits it | `auth.local_admin_identity(config, cli_flags.admin_name)` returns immediately; no IdP call, no prompt, no fallback. `ui.banner_admin_warning()` fires before the first turn. Every turn thereafter shows `[ADMIN]` on the `You:` prompt and `(admin mode)` on the `Coco:` label. Trace metadata carries `admin_mode=true, unauthenticated=true, provider="cli_admin"`. |
 | Capability denied at a gated call site (`read_packets`, `write_scratchpad`, `create_packet`, `integrate_packet`, `skill.fetch_url`, …) | Op aborts cleanly per §5.9 table; a `capability_denied` score is recorded on the current trace with `comment=f"{role}:{capability}"`; the user sees the dim hint `"I'm not able to do that for your account."` (rate-limited to once per turn). |
 | `override_conflict` denied during integrate-on-write | Conflict prompt is skipped; the integration is treated as user-rejected (no mutation). Trace records `auto_skipped_conflict`. No user-visible hint — the operation just doesn't take effect. |
 | Config: `auth.role_capabilities` missing for a role that the IdP returned | Fall through to `DEFAULT_ROLE_CAPABILITIES[role]`. No warning — this is the documented inheritance path. |
@@ -2477,6 +2601,7 @@ sequenceDiagram
 |---|---|
 | Swap embedding model | `config.embedding_model`; `embeddings.get_model` already caches |
 | Add a new tracing backend | Replace `tracing.py` with same context-manager interface |
+| Disable observability entirely | Set `tracing.enabled=false` in `config.json`. `tracing.init(config)` short-circuits before importing `langfuse`; every helper is a no-op for the process. Env credentials are ignored (config wins). Use for air-gapped installs, latency-sensitive runs, or when a shared `.env` provides Langfuse keys the current deployment must not use. |
 | Replace RRF with weighted-sum or rerank | `retrieval.rrf_packet_search` + `config.hybrid_search_method` (currently only RRF wired) |
 | Add image-embedding retrieval channel | Extend `Packet` schema with `image_vectors`; add Channel D in `rrf_packet_search`; update prompts |
 | Per-facet strength | Move `strength_events` from `Packet` onto `TopicFacet`; update `compute_strength` callsites; update slice selection to pick per-facet |
@@ -2497,6 +2622,8 @@ sequenceDiagram
 | Register a new agentic skill | Pick a capability id `skill.<name>`; add it to `auth.CAPABILITIES`; add it to the relevant roles in `DEFAULT_ROLE_CAPABILITIES` and the deployment's `config.auth.role_capabilities`; in the skill's invocation site, call `if not session.user.can("skill.<name>"): ...` exactly as the table in §5.9 specifies. |
 | Argument-level capability gating | Wrap the gated call in a small helper that takes both `capability` and a `args -> bool` predicate (e.g. `domain in allowlist`). Hint message and trace score stay the same; only the predicate composition is new. |
 | Per-user capability override via Entra claims | Extend `parse_role_from_entra_claims` to read an additional `scopes` (or custom) claim; in `resolve_capabilities` union the claim-derived set onto the role's baseline. Store the union back on `Identity.capabilities`. |
+| Add non-admin CLI identity shortcuts (e.g. `--as viewer`) | Follow the `--admin` pattern (§5.12): parse the flag in `__main__`, add an `auth.local_synthesized_identity(role, config)` factory, gate on a new config knob (e.g. `auth.allow_cli_identity_synthesis`), tag the identity with `provider="cli_<role>"`, and reuse `banner_admin_warning`-style unmissable visual signalling adapted per role. Never widen `allow_cli_admin` to cover lower-trust roles — keep each escape hatch gated by its own knob so operators can enable them independently. |
+| Persist admin-mode marker on `PacketSource` | Today the `provider="cli_admin"` marker lives only on the session's Langfuse trace metadata. Adding a `provider` field to `PacketSource` (populated from `writer.provider`) would let audit tooling filter unauthenticated-admin writes at the packet level. Backwards-compatible: existing packets default to `provider=None`, treated as "unknown / pre-marker". |
 
 ### 10.1 LLM SDK migration (this revision)
 

@@ -192,14 +192,14 @@ She may follow that refusal with one short, optional line offering a productive 
 
 ### What "packet-anchored" means
 
-The load-bearing test: **can Coco name the specific packet-fact her answer starts from?** If yes, the answer is anchored. If no — if the answer would be the same even without the packet — it's ungrounded, and she refuses.
+The load-bearing test: **can Coco name a specific packet-fact that contributes significantly to her answer?** "Significantly" means the packet fact does real work in the reasoning — take it away and the answer collapses. If yes, the answer is anchored. If no — if the answer would be the same even without the packet — it's ungrounded, and she refuses.
 
 Coco may:
 
 - **Quote or paraphrase** any content from loaded packets.
 - **Synthesize across loaded packets** — if packet A says X and packet B says Y, combine them.
 - **Reason within loaded content** — affirm implications a packet directly states.
-- **Reason FROM a packet fact using general knowledge as connective tissue** — combine a packet fact with common-knowledge premises to derive a further conclusion. Example: if a packet says "diamond is hard enough to cut glass" and the user asks "can diamond cut paper?", she may reason from the packet fact (diamond cuts glass) via the general premise (paper is softer than glass) to answer "yes, diamond can cut paper." The packet fact is the anchor; general knowledge bridges it to the answer.
+- **Reason FROM a packet fact using general knowledge as connective tissue** — combine a packet fact with common-knowledge premises to derive a further conclusion, including conclusions that *negate* what the user asked. Example: if a packet says "diamond is hard enough to cut glass and steel" and the user asks "can glass cut diamond?", she may reason from the packet fact (diamond cuts glass) via the general principle (harder materials cut softer ones — so if diamond cuts glass, diamond is harder than glass) to conclude "no, glass cannot cut diamond." The packet fact is the anchor and contributes significantly to the answer; general knowledge bridges it to the conclusion. When the packet-fact and general knowledge can be combined so that **the packet contributes significantly** to the answer, Coco may answer.
 
 Coco must NOT:
 
@@ -220,8 +220,8 @@ Coco must NOT:
 - **Synthesis across two packets.**
   Packet A: `"Alka lives in Delhi."` Packet B: `"Shishir works in Bangalore."` Q: *"Where do Alka and Shishir live/work?"* → A: "Alka lives in Delhi and Shishir works in Bangalore." (Anchored: both packets.)
 
-- **Reasoning FROM a packet fact via general knowledge.**
-  Packet: `"Diamond is hard enough to cut glass."` Q: *"Can diamond cut paper?"* → A: "Yes — the packet notes diamond can cut glass. Paper is much softer than glass, so diamond can definitely cut paper." (Anchored: diamond-hardness fact. Bridge: paper vs glass hardness — general knowledge.)
+- **Reasoning FROM a packet fact via a general principle (negation).**
+  Packet: `"Diamond is hard enough to cut glass and steel."` Q: *"Can glass cut diamond?"* → A: "No — the packet says diamond cuts glass, which means diamond must be harder than glass. Harder materials cut softer ones, not the other way around, so glass cannot cut diamond." (Anchored: the diamond-cuts-glass fact. Bridge: the general principle that harder cuts softer, applied in reverse. The packet contributes *significantly* — without it there would be no established comparison between glass's hardness and diamond's, and no answer either way.)
 
 - **Partial-coverage split.**
   Packet: `"Alka lives in Delhi."` Q: *"Does Alka like coffee?"* → A: "I know Alka lives in Delhi. I do not know about her coffee preferences." (Anchored on the covered part; refused on the uncovered part.)
@@ -541,6 +541,29 @@ Default capability map (overridable in `config.auth.role_capabilities`):
 
 Design intent: the moment a user signs in, Coco should treat their name (and the fact of their being logged in) as ambient knowledge — the same way a colleague who just shook your hand doesn't need to keep asking your name mid-conversation.
 
+### Local admin mode (developer / testing only)
+
+Coco supports a **`--admin` command-line flag** that bypasses SSO entirely and drops the session straight into a synthesized `admin` identity. This is a **developer escape hatch** for quick local iteration on prompts, thresholds, and the write path — no IdP round-trip, no email → role lookup, full capabilities from turn one.
+
+**Why it exists.** Tuning Coco is empirical: try a prompt change, restart, watch what happens; try a threshold, restart, watch again. Requiring an interactive SSO login on every restart is the wrong friction. `--admin` collapses "start Coco, do the thing" to a single command; conflict prompts fire, `create_packet` / `integrate_packet` / `override_conflict` all run without capability denials, and traces still capture everything so the tuning session stays inspectable.
+
+**Why it is safe by default.** A CLI flag that bypasses auth would be an obvious backdoor around the entire trust model if it worked in every deployment. So the design forces three independent gates:
+
+1. **Config-gated.** `auth.allow_cli_admin` defaults to `false`. Passing `--admin` when the config disallows it aborts startup with an error before any turn runs. Production configs never set this to `true`; local development configs may.
+2. **Explicit flag only.** There is no environment variable, no config option, and no "default admin" fallback that flips a normal startup into admin mode. The user has to type `--admin` on the command line every time.
+3. **Honest provenance.** The synthesized identity carries `provider="cli_admin"` and `email=None`. Every packet a `--admin` session writes records `speaker_email=None`, `speaker_role="admin"`, and `provider="cli_admin"` in its `PacketSource`. Deployments that don't trust CLI-admin provenance can filter on that string when curating packets.
+
+**Production reachability of admin capabilities.** In production, admin capabilities are reachable **only** through a real SSO login that resolves the current user to `role == "admin"` via the provider's claims (Entra) or the email → role map (Google/other). The CLI path is closed by config.
+
+**Visual signalling — the user must not lose track of what mode they are in.** Local admin mode confers full write/delete power without a password; if the user forgets the mode is on, they might make mutations they'd never make in a normal session. So every user-facing surface makes the mode unmissable:
+
+- **Startup warning banner (unmissable).** A bright red/yellow warning block is printed before the first turn — bordered, multi-line, and impossible to skim past. Wording explicitly says the session is unauthenticated, that this is unadvisable outside local dev, and that it must not be used in production. On non-TTY stdout the same wording renders as plain ASCII with the same content.
+- **Per-turn indicator.** The `You:` prompt is prefixed with a bold red `[ADMIN]` badge, and the `Coco:` reply label is suffixed with a dim red `(admin mode)` marker. The user cannot type a message without seeing the badge on the same line — this survives long conversations where the startup banner has scrolled off.
+- **Session summary line.** The goodbye banner at session end reprints a compact `local admin mode — session was unauthenticated` reminder so the user leaves the CLI aware of the mode they just ran in.
+- **Trace metadata.** The Langfuse `session_context` records `admin_mode=true`, `provider="cli_admin"`, and `unauthenticated=true`. Post-hoc review can filter to admin-mode sessions and treat their trust claims accordingly.
+
+**Where this does not weaken the trust model.** Packets written in admin mode still get real `PacketSource` entries with `role_authoritativeness = 1.0`. That's deliberate: an admin's word carries admin trust regardless of how the admin was authenticated. What changes is only *how* the admin identity was acquired — via a CLI flag rather than an IdP round-trip — which is honestly recorded on `provider="cli_admin"`. The scalar trust and capabilities are the same as any other admin; the audit trail simply says "this admin came in through the local dev door."
+
 ---
 
 ## Knowledge source provenance & effective authoritativeness
@@ -779,6 +802,7 @@ A conversation about Alka's parents matches via the "Alka's family" facet — ev
 | Retrieval bias by authoritativeness | Add a small `h(packet.authoritativeness)` to the RRF final score, parallel to the strength bias | Trust breaks ties between equally-relevant packets; default scale is small so sharp semantic matches still win |
 | Capability source | Default map in `config.auth.role_capabilities` keyed by role string | One source of truth for the deployment; Entra claims still resolve the role string, and the role string then maps to capabilities. Future per-user capability overrides via claims remain optional |
 | Default capability tiering | admin = all; author/user = write paths + `skill.fetch_url`; viewer/anonymous = read-only | Mirrors the trust spectrum; "viewer" is a strict read-only conversational seat, "user" is the default writer for personal installs |
+| Local admin mode (CLI flag) | `--admin` at process start synthesizes a full-trust admin `Identity` without SSO; gated by `auth.allow_cli_admin` (default `false`); visually flagged by a startup warning banner and a per-turn `[ADMIN]` prompt badge; every packet's `PacketSource` records `provider="cli_admin"` | Tuning prompts and thresholds needs many quick startups where an SSO round-trip is wrong friction; but a flag that bypasses auth cannot be reachable in production. Config-gate + explicit CLI flag + persistent visual highlighting keep the escape hatch honest — a developer can move fast locally, but the mode is unmissable and provenance is preserved on every write |
 
 ---
 

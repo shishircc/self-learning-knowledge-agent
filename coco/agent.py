@@ -836,7 +836,7 @@ async def _handle_ingest(
 
         if not successes:
             tracing.update(span, output={"failures": failures, "successes": 0})
-            ui.coco_label()
+            ui.coco_label(admin_mode=session.admin_mode)
             reasons = "; ".join(f"{u}: {r}" for u, r in failures)
             msg = f"I couldn't read the link you shared. {reasons}\n"
             sys.stdout.write(msg)
@@ -862,7 +862,7 @@ async def _handle_ingest(
             image_blocks_max=config.get("image_blocks_max_per_turn"),
         )
 
-        ui.coco_label()
+        ui.coco_label(admin_mode=session.admin_mode)
         raw = await _claude_call(
             system_prompt,
             user_blocks,
@@ -1092,7 +1092,7 @@ async def _handle_document_upload(
                 metadata = documents_module.open_metadata(path, config)
             except documents_module.DocumentReadError as e:
                 open_errors.append((raw_path, str(e)))
-                ui.coco_label()
+                ui.coco_label(admin_mode=session.admin_mode)
                 msg = f"I couldn't open {raw_path}: {e}\n"
                 sys.stdout.write(msg)
                 sys.stdout.flush()
@@ -1100,7 +1100,7 @@ async def _handle_document_upload(
                 continue
 
             opened_files.append(metadata.filename)
-            ui.coco_label()
+            ui.coco_label(admin_mode=session.admin_mode)
             opening_line = (
                 f"Reading {metadata.filename} "
                 f"({metadata.format}, {metadata.size_bytes // 1024}KB, "
@@ -1649,7 +1649,7 @@ async def _chat_turn_inner(
     if len(user_content) == 1 and user_content[0].get("type") == "text":
         user_content = user_content[0]["text"]
 
-    ui.coco_label()
+    ui.coco_label(admin_mode=session.admin_mode)
     raw = await _claude_call(
         system_prompt,
         user_content,
@@ -1818,13 +1818,15 @@ async def _chat_turn_inner(
 # run_session — streaming event loop
 # -----------------------------------------------------------------------------
 
-async def run_session():
+async def run_session(cli_flags=None):
     config = load_config()
 
     # Acquire identity BEFORE opening the input stream. acquire_identity may
     # itself read from stdin (the provider prompt) and we don't want the
-    # streaming reader to compete for the tty.
-    identity = await acquire_identity(config)
+    # streaming reader to compete for the tty. `cli_flags` (parsed by
+    # __main__) is threaded through so the local-admin short-circuit (--admin)
+    # can fire before any IdP or interactive prompt runs.
+    identity = await acquire_identity(config, cli_flags=cli_flags)
 
     store = PacketStore(config["data_dir"])
     scratchpad = Scratchpad(config["data_dir"])
@@ -1832,12 +1834,19 @@ async def run_session():
     session_n = counter.increment()
     scratchpad.prune_old(session_n, config["scratchpad_discard_after_sessions"])
 
-    tracing_on = tracing.init()
+    # Pass config so `tracing.enabled=false` can short-circuit before we
+    # import langfuse or read LANGFUSE_* env vars. Config wins over env.
+    tracing_on = tracing.init(config)
 
     # Pre-load embedding model so the first extraction is not blocked on it.
     get_model(config["embedding_model"])
 
     session = Session(user=identity)
+
+    # Unmissable warning for local admin mode — before the welcome banner so
+    # the user cannot miss it, and again in the goodbye line at session end.
+    if session.admin_mode:
+        ui.banner_admin_warning()
 
     ui.banner_welcome(identity.name)
 
@@ -1862,7 +1871,7 @@ async def run_session():
     ):
         in_flight: set[asyncio.Task] = set()
 
-        async for event in streaming.input_stream(config):
+        async for event in streaming.input_stream(config, admin_mode=session.admin_mode):
             if event.kind == "cancel":
                 break
 
@@ -1916,5 +1925,5 @@ async def run_session():
             f"developer mode · session ended · "
             f"{len(session.topics)} topics, {len(session.loaded_packets)} packets loaded"
         )
-    ui.banner_goodbye()
+    ui.banner_goodbye(admin_mode=session.admin_mode)
     tracing.flush()
